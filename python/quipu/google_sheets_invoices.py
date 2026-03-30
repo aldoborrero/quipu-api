@@ -122,6 +122,7 @@ PAYMENT_STATUS_LABELS: dict[str, str] = {
 
 NUM_QUARTERS: int = 4
 FIRST_DATA_ROW: int = 2  # 1-indexed row where data starts (after header)
+SHEETS_EPOCH: datetime.date = datetime.date(1899, 12, 30)  # Google Sheets serial date epoch
 
 # Type alias for invoice record dicts
 InvoiceRecord = dict[str, Any]
@@ -159,8 +160,7 @@ def _date_serial(d: datetime.date | None) -> int | str:
     """
     if d is None:
         return ""
-    epoch = datetime.date(1899, 12, 30)
-    return (d - epoch).days
+    return (d - SHEETS_EPOCH).days
 
 
 def _payment_status_label(status: Any) -> str:
@@ -522,22 +522,23 @@ def format_sheet(
         num_rows: number of data rows (excluding header)
         quarter_data: list of quarter numbers (1-4) per data row, for row coloring on ingresos
     """
-    set_frozen(worksheet, rows=1)
-
-    if num_rows == 0:
-        return
-
-    total_rows = num_rows + 1  # +1 for header
     num_cols = NUM_INGRESOS_COLS if tipo == TIPO_INGRESOS else NUM_GASTOS_COLS
     last_col = _col_letter(num_cols)
 
-    # --- Header formatting ---
+    set_frozen(worksheet, rows=1)
+
+    # --- Header formatting (always applied, even for empty sheets) ---
     header_fmt = CellFormat(
         backgroundColor=HEADER_BG_COLOR,
         textFormat=TextFormat(bold=True, foregroundColor=HEADER_TEXT_COLOR),
         horizontalAlignment="CENTER",
     )
     format_cell_range(worksheet, f"A1:{last_col}1", header_fmt)
+
+    if num_rows == 0:
+        return
+
+    total_rows = num_rows + 1  # +1 for header
 
     # --- Border for all cells with data ---
     thin_border = Border("SOLID", BORDER_COLOR)
@@ -566,15 +567,39 @@ def format_sheet(
         format_cell_range(worksheet, f"K{FIRST_DATA_ROW}:K{total_rows}", wrap_fmt)
 
     # --- Row coloring by quarter (ingresos master sheet only) ---
+    # Batch all row color requests into a single API call to avoid per-row overhead.
     if tipo == TIPO_INGRESOS and quarter_data:
+        color_requests: list[dict[str, Any]] = []
         for i, q in enumerate(quarter_data):
             if q == 1:  # Q1 is white (default), skip
                 continue
             color = QUARTER_COLORS.get(q)
-            if color:
-                row_num = i + FIRST_DATA_ROW
-                row_range = f"A{row_num}:{last_col}{row_num}"
-                format_cell_range(worksheet, row_range, CellFormat(backgroundColor=color))
+            if not color:
+                continue
+            row_idx = i + 1  # 0-based row index; header is row 0, first data row is 1
+            color_requests.append({
+                "repeatCell": {
+                    "range": {
+                        "sheetId": worksheet.id,
+                        "startRowIndex": row_idx,
+                        "endRowIndex": row_idx + 1,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": num_cols,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": {
+                                "red": color.red,
+                                "green": color.green,
+                                "blue": color.blue,
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat.backgroundColor",
+                }
+            })
+        if color_requests:
+            worksheet.spreadsheet.batch_update({"requests": color_requests})
 
     # --- Column widths ---
     sheet_id = worksheet.id
@@ -632,6 +657,7 @@ def main(year: int | None = None, spreadsheet_id: str | None = None, credentials
     else:
         gc = gspread.service_account()
 
+    spreadsheet: gspread.Spreadsheet
     if spreadsheet_id:
         spreadsheet = gc.open_by_key(spreadsheet_id)
     else:
