@@ -1,0 +1,207 @@
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any, TypeVar, BinaryIO, TextIO, TYPE_CHECKING, Generator
+
+from attrs import define as _attrs_define
+from attrs import field as _attrs_field
+
+from ..types import UNSET, Unset
+
+from ..models.ticket_writable_attributes_kind import TicketWritableAttributesKind
+from ..types import UNSET, Unset
+from dateutil.parser import isoparse
+from typing import cast
+import datetime
+
+
+
+
+
+
+T = TypeVar("T", bound="TicketWritableAttributes")
+
+
+
+@_attrs_define
+class TicketWritableAttributes:
+    """ 
+        Attributes:
+            kind (TicketWritableAttributesKind):
+            issue_date (datetime.date):
+            filing_number (None | str | Unset):
+            due_dates (list[datetime.date] | Unset):
+            paid_at (datetime.date | None | Unset):
+            payment_method (str | Unset):
+            tags (list[str] | Unset):
+            notes (str | Unset):
+     """
+
+    kind: TicketWritableAttributesKind
+    issue_date: datetime.date
+    filing_number: None | str | Unset = UNSET
+    due_dates: list[datetime.date] | Unset = UNSET
+    paid_at: datetime.date | None | Unset = UNSET
+    payment_method: str | Unset = UNSET
+    tags: list[str] | Unset = UNSET
+    notes: str | Unset = UNSET
+    additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
+
+
+
+
+
+    def to_dict(self) -> dict[str, Any]:
+        kind = self.kind.value
+
+        issue_date = self.issue_date.isoformat()
+
+        filing_number: None | str | Unset
+        if isinstance(self.filing_number, Unset):
+            filing_number = UNSET
+        else:
+            filing_number = self.filing_number
+
+        due_dates: list[str] | Unset = UNSET
+        if not isinstance(self.due_dates, Unset):
+            due_dates = []
+            for due_dates_item_data in self.due_dates:
+                due_dates_item = due_dates_item_data.isoformat()
+                due_dates.append(due_dates_item)
+
+
+
+        paid_at: None | str | Unset
+        if isinstance(self.paid_at, Unset):
+            paid_at = UNSET
+        elif isinstance(self.paid_at, datetime.date):
+            paid_at = self.paid_at.isoformat()
+        else:
+            paid_at = self.paid_at
+
+        payment_method = self.payment_method
+
+        tags: list[str] | Unset = UNSET
+        if not isinstance(self.tags, Unset):
+            tags = self.tags
+
+
+
+        notes = self.notes
+
+
+        field_dict: dict[str, Any] = {}
+        field_dict.update(self.additional_properties)
+        field_dict.update({
+            "kind": kind,
+            "issue_date": issue_date,
+        })
+        if filing_number is not UNSET:
+            field_dict["filing_number"] = filing_number
+        if due_dates is not UNSET:
+            field_dict["due_dates"] = due_dates
+        if paid_at is not UNSET:
+            field_dict["paid_at"] = paid_at
+        if payment_method is not UNSET:
+            field_dict["payment_method"] = payment_method
+        if tags is not UNSET:
+            field_dict["tags"] = tags
+        if notes is not UNSET:
+            field_dict["notes"] = notes
+
+        return field_dict
+
+
+
+    @classmethod
+    def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        d = dict(src_dict)
+        kind = TicketWritableAttributesKind(d.pop("kind"))
+
+
+
+
+        issue_date = isoparse(d.pop("issue_date")).date()
+
+
+
+
+        def _parse_filing_number(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        filing_number = _parse_filing_number(d.pop("filing_number", UNSET))
+
+
+        _due_dates = d.pop("due_dates", UNSET)
+        due_dates: list[datetime.date] | Unset = UNSET
+        if _due_dates is not UNSET:
+            due_dates = []
+            for due_dates_item_data in _due_dates:
+                due_dates_item = isoparse(due_dates_item_data).date()
+
+
+
+                due_dates.append(due_dates_item)
+
+
+        def _parse_paid_at(data: object) -> datetime.date | None | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            try:
+                if not isinstance(data, str):
+                    raise TypeError()
+                paid_at_type_0 = isoparse(data).date()
+
+
+
+                return paid_at_type_0
+            except (TypeError, ValueError, AttributeError, KeyError):
+                pass
+            return cast(datetime.date | None | Unset, data)
+
+        paid_at = _parse_paid_at(d.pop("paid_at", UNSET))
+
+
+        payment_method = d.pop("payment_method", UNSET)
+
+        tags = cast(list[str], d.pop("tags", UNSET))
+
+
+        notes = d.pop("notes", UNSET)
+
+        ticket_writable_attributes = cls(
+            kind=kind,
+            issue_date=issue_date,
+            filing_number=filing_number,
+            due_dates=due_dates,
+            paid_at=paid_at,
+            payment_method=payment_method,
+            tags=tags,
+            notes=notes,
+        )
+
+
+        ticket_writable_attributes.additional_properties = d
+        return ticket_writable_attributes
+
+    @property
+    def additional_keys(self) -> list[str]:
+        return list(self.additional_properties.keys())
+
+    def __getitem__(self, key: str) -> Any:
+        return self.additional_properties[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.additional_properties[key] = value
+
+    def __delitem__(self, key: str) -> None:
+        del self.additional_properties[key]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self.additional_properties

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quipu-api-client"
+version = "1.0.0"
+description = "A client library for accessing Quipu API (generated from openapi.yaml)"
+requires-python = ">=3.10"
+dependencies = [
+  "httpx>=0.23.0,<0.29.0",
+  "attrs>=22.2.0",
+  "python-dateutil>=2.8.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-httpx>=0.30", "ruff>=0.5"]
+
+[project.scripts]
+quipu-sync = "quipu.sync_to_quipu:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F", "I", "UP"]
