@@ -106,6 +106,7 @@ GASTOS_COL_IVA_PCT: str = "H"
 GASTOS_COL_TOTAL: str = "I"
 
 CONCEPTO_WIDTH_PX: int = 300
+SPREADSHEET_LOCALE: str = "es_ES"
 
 # Formatting patterns
 DATE_PATTERN: str = "dd/MM/yyyy"
@@ -151,11 +152,15 @@ def _to_float(s: Any) -> float | None:
         return None
 
 
-def _fmt_date(d: datetime.date | None) -> str:
-    """Format a date as dd/mm/yyyy, or empty string if None."""
+def _date_serial(d: datetime.date | None) -> int | str:
+    """Convert a date to a Google Sheets serial number, or empty string if None.
+
+    Google Sheets epoch is 1899-12-30 (with the Lotus 1-2-3 leap year bug).
+    """
     if d is None:
         return ""
-    return d.strftime("%d/%m/%Y")
+    epoch = datetime.date(1899, 12, 30)
+    return (d - epoch).days
 
 
 def _payment_status_label(status: Any) -> str:
@@ -369,14 +374,16 @@ def _fetch_all_invoices(client: Client, kind: GetInvoicesFilterkind, year: int) 
                 }
                 all_invoices.append(record)
 
-            # Pagination
+            # Pagination — break when on the last page (or when meta is absent)
             meta = _val(collection.meta)
-            if meta:
-                pagination = _val(meta.pagination_info)
-                if pagination:
-                    total_pages: int = _val(pagination.total_pages) or 1
-                    if page >= total_pages:
-                        break
+            if not meta:
+                break
+            pagination = _val(meta.pagination_info)
+            if not pagination:
+                break
+            total_pages: int = _val(pagination.total_pages) or 1
+            if page >= total_pages:
+                break
             page += 1
 
     # Sort by issue_date ascending
@@ -414,9 +421,9 @@ def filter_by_quarter(entries: list[InvoiceRecord], quarter: int) -> list[Invoic
 def _ingreso_row(r: InvoiceRecord) -> list[Any]:
     """Build a single row for the Ingresos sheet."""
     return [
-        _fmt_date(r["issue_date"]),
-        _fmt_date(r["due_date"]),
-        _fmt_date(r["paid_at"]),
+        _date_serial(r["issue_date"]),
+        _date_serial(r["due_date"]),
+        _date_serial(r["paid_at"]),
         r["number"],
         r["invoice_number"],
         r["kind_label"],
@@ -437,7 +444,7 @@ def _ingreso_row(r: InvoiceRecord) -> list[Any]:
 def _gasto_row(r: InvoiceRecord) -> list[Any]:
     """Build a single row for the Gastos sheet."""
     return [
-        _fmt_date(r["issue_date"]),
+        _date_serial(r["issue_date"]),
         r["invoice_number"],
         r["contact_name"],
         r["contact_account"],
@@ -570,10 +577,24 @@ def format_sheet(
                 format_cell_range(worksheet, row_range, CellFormat(backgroundColor=color))
 
     # --- Column widths ---
-    requests: list[dict[str, Any]] = []
     sheet_id = worksheet.id
+
+    # Auto-resize all columns based on content first
+    auto_requests: list[dict[str, Any]] = [{
+        "autoResizeDimensions": {
+            "dimensions": {
+                "sheetId": sheet_id,
+                "dimension": "COLUMNS",
+                "startIndex": 0,
+                "endIndex": num_cols,
+            }
+        }
+    }]
+    worksheet.spreadsheet.batch_update({"requests": auto_requests})
+
+    # Then override Concepto (K) with fixed width so auto-resize doesn't undo it
     if tipo == TIPO_INGRESOS:
-        requests.append({
+        fix_requests: list[dict[str, Any]] = [{
             "updateDimensionProperties": {
                 "range": {
                     "sheetId": sheet_id,
@@ -584,18 +605,8 @@ def format_sheet(
                 "properties": {"pixelSize": CONCEPTO_WIDTH_PX},
                 "fields": "pixelSize",
             }
-        })
-    requests.append({
-        "autoResizeDimensions": {
-            "dimensions": {
-                "sheetId": sheet_id,
-                "dimension": "COLUMNS",
-                "startIndex": 0,
-                "endIndex": num_cols,
-            }
-        }
-    })
-    worksheet.spreadsheet.batch_update({"requests": requests})
+        }]
+        worksheet.spreadsheet.batch_update({"requests": fix_requests})
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +632,6 @@ def main(year: int | None = None, spreadsheet_id: str | None = None, credentials
     else:
         gc = gspread.service_account()
 
-    spreadsheet: gspread.Spreadsheet
     if spreadsheet_id:
         spreadsheet = gc.open_by_key(spreadsheet_id)
     else:
@@ -631,6 +641,14 @@ def main(year: int | None = None, spreadsheet_id: str | None = None, credentials
         except gspread.SpreadsheetNotFound:
             spreadsheet = gc.create(title)
             print(f"Created new spreadsheet: {title}")
+
+    # Ensure Spanish locale so currency/date formats render correctly
+    spreadsheet.batch_update({"requests": [{
+        "updateSpreadsheetProperties": {
+            "properties": {"locale": SPREADSHEET_LOCALE},
+            "fields": "locale",
+        }
+    }]})
 
     print(f"Writing to spreadsheet: {spreadsheet.title}")
 
