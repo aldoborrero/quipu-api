@@ -1,0 +1,12 @@
+result
+result-*
+.direnv/
+.envrc.local
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
