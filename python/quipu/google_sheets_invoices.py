@@ -35,7 +35,8 @@ from quipu_client.types import Unset
 # Constants
 # ---------------------------------------------------------------------------
 
-INGRESOS_HEADERS: list[str] = [
+# User-facing column headers (Spanish, as required by the output spreadsheet)
+INCOME_HEADERS: list[str] = [
     "Fecha de emisión",
     "Vencimiento",
     "Fecha de pago",
@@ -55,7 +56,7 @@ INGRESOS_HEADERS: list[str] = [
     "Recargo de equivalencia",
 ]
 
-GASTOS_HEADERS: list[str] = [
+EXPENSES_HEADERS: list[str] = [
     "Fecha de emisión",
     "Número de Factura",
     "Proveedor",
@@ -67,13 +68,13 @@ GASTOS_HEADERS: list[str] = [
     "Total",
 ]
 
-NUM_INGRESOS_COLS: int = len(INGRESOS_HEADERS)
-NUM_GASTOS_COLS: int = len(GASTOS_HEADERS)
+NUM_INCOME_COLS: int = len(INCOME_HEADERS)
+NUM_EXPENSES_COLS: int = len(EXPENSES_HEADERS)
 
-TIPO_INGRESOS: str = "ingresos"
-TIPO_GASTOS: str = "gastos"
+SHEET_TYPE_INCOME: str = "income"
+SHEET_TYPE_EXPENSES: str = "expenses"
 
-# Quarter colors for row highlighting (ingresos master sheet)
+# Quarter colors for row highlighting (income master sheet)
 COLOR_WHITE: Color = Color(1, 1, 1)
 COLOR_Q2_YELLOW: Color = Color(1, 0.976, 0.769)  # #fff9c4
 COLOR_Q3_GREEN: Color = Color(0.910, 0.961, 0.914)  # #e8f5e9
@@ -90,22 +91,22 @@ HEADER_BG_COLOR: Color = Color(0.827, 0.827, 0.827)  # #d3d3d3
 HEADER_TEXT_COLOR: Color = Color(0, 0, 0)
 BORDER_COLOR: Color = Color(0.8, 0.8, 0.8)
 
-# Column indices (0-based) for Ingresos sheet
-INGRESOS_DATE_COLS: list[str] = ["A", "B", "C"]
-INGRESOS_COL_BASE: str = "N"
-INGRESOS_COL_IVA: str = "O"
-INGRESOS_COL_IVA_PCT: str = "P"
-INGRESOS_COL_SURCHARGE: str = "Q"
-INGRESOS_COL_CONCEPTO_IDX: int = 10  # 0-based index for column K
+# Column letters for the Income sheet
+INCOME_DATE_COLS: list[str] = ["A", "B", "C"]
+INCOME_COL_BASE: str = "N"
+INCOME_COL_VAT: str = "O"
+INCOME_COL_VAT_PCT: str = "P"
+INCOME_COL_SURCHARGE: str = "Q"
+INCOME_COL_CONCEPT_IDX: int = 10  # 0-based index for column K
 
-# Column letters for Gastos sheet
-GASTOS_DATE_COLS: list[str] = ["A"]
-GASTOS_COL_BASE: str = "F"
-GASTOS_COL_IVA: str = "G"
-GASTOS_COL_IVA_PCT: str = "H"
-GASTOS_COL_TOTAL: str = "I"
+# Column letters for the Expenses sheet
+EXPENSES_DATE_COLS: list[str] = ["A"]
+EXPENSES_COL_BASE: str = "F"
+EXPENSES_COL_VAT: str = "G"
+EXPENSES_COL_VAT_PCT: str = "H"
+EXPENSES_COL_TOTAL: str = "I"
 
-CONCEPTO_WIDTH_PX: int = 300
+CONCEPT_WIDTH_PX: int = 300
 SPREADSHEET_LOCALE: str = "es_ES"
 
 # Formatting patterns
@@ -113,6 +114,7 @@ DATE_PATTERN: str = "dd/MM/yyyy"
 CURRENCY_PATTERN: str = '#,##0.00 "€"'
 INTEGER_PATTERN: str = "0"
 
+# Payment status API values to Spanish display labels
 PAYMENT_STATUS_LABELS: dict[str, str] = {
     "paid": "Pagado",
     "due": "Pendiente de cobro",
@@ -127,7 +129,7 @@ SHEETS_EPOCH: datetime.date = datetime.date(1899, 12, 30)  # Google Sheets seria
 # Type alias for invoice record dicts
 InvoiceRecord = dict[str, Any]
 
-# Sheet config: (worksheet, tipo, num_data_rows, quarter_data_or_none)
+# Sheet config: (worksheet, sheet_type, num_data_rows, quarter_data_or_none)
 SheetConfig = tuple[gspread.Worksheet, str, int, list[int] | None]
 
 
@@ -137,14 +139,14 @@ SheetConfig = tuple[gspread.Worksheet, str, int, list[int] | None]
 
 
 def _val(attr: Any) -> Any:
-    """Return None for UNSET values, otherwise the value itself."""
+    """Return None for Unset values, otherwise the value itself."""
     if isinstance(attr, Unset) or attr is None:
         return None
     return attr
 
 
 def _to_float(s: Any) -> float | None:
-    """Convert a value to float, returning None for UNSET/None/invalid."""
+    """Convert a value to float, returning None for Unset/None/invalid."""
     if isinstance(s, Unset) or s is None:
         return None
     try:
@@ -164,7 +166,7 @@ def _date_serial(d: datetime.date | None) -> int | str:
 
 
 def _payment_status_label(status: Any) -> str:
-    """Translate a payment status enum value to a Spanish label."""
+    """Translate a payment status enum value to a Spanish display label."""
     if isinstance(status, Unset) or status is None:
         return ""
     return PAYMENT_STATUS_LABELS.get(str(status.value), str(status.value))
@@ -200,10 +202,10 @@ def _extract_item_data(
     items_map: dict[str, Any],
     item_ref: Any,
 ) -> tuple[str | None, float | None, float | None]:
-    """Extract concept, vat_percent, and surcharge from an included item.
+    """Extract concept, vat_percent, and surcharge from an included line item.
 
     Returns:
-        (concept, vat_percent, surcharge_amount) — any may be None.
+        (concept, vat_percent, surcharge_amount) -- any may be None.
     """
     item_id = getattr(item_ref, "id", None)
     if item_id is None or str(item_id) not in items_map:
@@ -216,7 +218,7 @@ def _extract_item_data(
 
     additional: dict[str, Any] = getattr(item_attrs, "additional_properties", {})
 
-    # Concept
+    # Concept text
     concept: str | None = None
     for field in ("concept", "description"):
         raw = getattr(item_attrs, field, None)
@@ -252,7 +254,7 @@ def _infer_vat_percent(
     vat_amount: float | None,
     base: float | None,
 ) -> int:
-    """Determine the IVA % from line items or by inference from amounts."""
+    """Determine the VAT % from line items or by inference from amounts."""
     if item_vat_percents:
         return int(item_vat_percents[0])
     if vat_amount is None or vat_amount == 0:
@@ -317,11 +319,11 @@ def _fetch_all_invoices(client: Client, kind: GetInvoicesFilterkind, year: int) 
                             if surcharge is not None:
                                 item_surcharges.append(surcharge)
 
-                # Determine if rectificativa
-                is_rectificativa = False
+                # Determine if this is an amending (rectificative) invoice
+                is_amending = False
                 if rels and not isinstance(rels.amended_invoice, Unset) and rels.amended_invoice:
                     if _val(rels.amended_invoice.data) is not None:
-                        is_rectificativa = True
+                        is_amending = True
 
                 issue_date: datetime.date | None = _val(attrs.issue_date)
                 due_dates: list[datetime.date] | None = _val(attrs.due_dates)
@@ -335,7 +337,8 @@ def _fetch_all_invoices(client: Client, kind: GetInvoicesFilterkind, year: int) 
                 vat_pct_value = _infer_vat_percent(item_vat_percents, vat_amount, base)
                 surcharge_total = sum(item_surcharges) if item_surcharges else 0.0
 
-                # For income invoices: recipient is the client; for expenses: issuer is the supplier
+                # For issued invoices: the recipient is the client
+                # For received invoices: the issuer is the supplier
                 if kind == GetInvoicesFilterkind.INCOME:
                     contact_name = _val(attrs.recipient_name) or ""
                     contact_tax_id = _val(attrs.recipient_tax_id) or ""
@@ -357,14 +360,14 @@ def _fetch_all_invoices(client: Client, kind: GetInvoicesFilterkind, year: int) 
                     "paid_at": paid_at,
                     "number": _val(attrs.number) or "",
                     "invoice_number": _val(attrs.number) or "",
-                    "kind_label": "Rectificativa" if is_rectificativa else "Factura",
+                    "kind_label": "Rectificativa" if is_amending else "Factura",
                     "contact_name": contact_name,
                     "contact_account": contact_account,
                     "contact_tax_id": contact_tax_id,
                     "contact_zip": contact_zip,
                     "concept": " | ".join(item_concepts) if item_concepts else "",
                     "payment_status": _payment_status_label(attrs.payment_status),
-                    "is_rectificativa": is_rectificativa,
+                    "is_amending": is_amending,
                     "base": base,
                     "vat_amount": vat_amount,
                     "vat_pct": vat_pct_value,
@@ -374,7 +377,7 @@ def _fetch_all_invoices(client: Client, kind: GetInvoicesFilterkind, year: int) 
                 }
                 all_invoices.append(record)
 
-            # Pagination — break when on the last page (or when meta is absent)
+            # Pagination -- break when on the last page (or when meta is absent)
             meta = _val(collection.meta)
             if not meta:
                 break
@@ -386,19 +389,19 @@ def _fetch_all_invoices(client: Client, kind: GetInvoicesFilterkind, year: int) 
                 break
             page += 1
 
-    # Sort by issue_date ascending
+    # Sort by issue date ascending
     all_invoices.sort(key=lambda r: r["issue_date"] or datetime.date.min)
     return all_invoices
 
 
-def fetch_ingresos(year: int) -> list[InvoiceRecord]:
-    """Fetch all issued invoices (facturas emitidas) for the given year."""
+def fetch_income(year: int) -> list[InvoiceRecord]:
+    """Fetch all issued invoices for the given year."""
     with create_client() as client:
         return _fetch_all_invoices(client, GetInvoicesFilterkind.INCOME, year)
 
 
-def fetch_gastos(year: int) -> list[InvoiceRecord]:
-    """Fetch all received invoices (facturas recibidas) for the given year."""
+def fetch_expenses(year: int) -> list[InvoiceRecord]:
+    """Fetch all received invoices for the given year."""
     with create_client() as client:
         return _fetch_all_invoices(client, GetInvoicesFilterkind.EXPENSES, year)
 
@@ -418,8 +421,8 @@ def filter_by_quarter(entries: list[InvoiceRecord], quarter: int) -> list[Invoic
 # ---------------------------------------------------------------------------
 
 
-def _ingreso_row(r: InvoiceRecord) -> list[Any]:
-    """Build a single row for the Ingresos sheet."""
+def _income_row(r: InvoiceRecord) -> list[Any]:
+    """Build a single row for the Income sheet."""
     return [
         _date_serial(r["issue_date"]),
         _date_serial(r["due_date"]),
@@ -433,7 +436,7 @@ def _ingreso_row(r: InvoiceRecord) -> list[Any]:
         r["contact_zip"],
         r["concept"],
         r["payment_status"],
-        "Sí" if r["is_rectificativa"] else "-",
+        "Sí" if r["is_amending"] else "-",
         r["base"] if r["base"] is not None else 0,
         _money_or_dash(r["vat_amount"]),
         r["vat_pct"],
@@ -441,8 +444,8 @@ def _ingreso_row(r: InvoiceRecord) -> list[Any]:
     ]
 
 
-def _gasto_row(r: InvoiceRecord) -> list[Any]:
-    """Build a single row for the Gastos sheet."""
+def _expense_row(r: InvoiceRecord) -> list[Any]:
+    """Build a single row for the Expenses sheet."""
     return [
         _date_serial(r["issue_date"]),
         r["invoice_number"],
@@ -509,7 +512,7 @@ def _apply_integer_format(worksheet: gspread.Worksheet, col: str, total_rows: in
 
 def format_sheet(
     worksheet: gspread.Worksheet,
-    tipo: str,
+    sheet_type: str,
     num_rows: int,
     quarter_data: list[int] | None = None,
 ) -> None:
@@ -517,16 +520,16 @@ def format_sheet(
 
     Args:
         worksheet: the gspread Worksheet
-        tipo: TIPO_INGRESOS or TIPO_GASTOS
+        sheet_type: SHEET_TYPE_INCOME or SHEET_TYPE_EXPENSES
         num_rows: number of data rows (excluding header)
-        quarter_data: list of quarter numbers (1-4) per data row, for row coloring on ingresos
+        quarter_data: list of quarter numbers (1-4) per data row, for row coloring on income sheets
     """
-    num_cols = NUM_INGRESOS_COLS if tipo == TIPO_INGRESOS else NUM_GASTOS_COLS
+    num_cols = NUM_INCOME_COLS if sheet_type == SHEET_TYPE_INCOME else NUM_EXPENSES_COLS
     last_col = _col_letter(num_cols)
 
     set_frozen(worksheet, rows=1)
 
-    # --- Header formatting (always applied, even for empty sheets) ---
+    # Header formatting (always applied, even for empty sheets)
     header_fmt = CellFormat(
         backgroundColor=HEADER_BG_COLOR,
         textFormat=TextFormat(bold=True, foregroundColor=HEADER_TEXT_COLOR),
@@ -539,35 +542,35 @@ def format_sheet(
 
     total_rows = num_rows + 1  # +1 for header
 
-    # --- Border for all cells with data ---
+    # Borders for all cells with data
     thin_border = Border("SOLID", BORDER_COLOR)
     border_fmt = CellFormat(
         borders=Borders(top=thin_border, bottom=thin_border, left=thin_border, right=thin_border)
     )
     format_cell_range(worksheet, f"A1:{last_col}{total_rows}", border_fmt)
 
-    # --- Date columns ---
-    if tipo == TIPO_INGRESOS:
-        _apply_date_format(worksheet, INGRESOS_DATE_COLS, total_rows)
+    # Date columns
+    if sheet_type == SHEET_TYPE_INCOME:
+        _apply_date_format(worksheet, INCOME_DATE_COLS, total_rows)
     else:
-        _apply_date_format(worksheet, GASTOS_DATE_COLS, total_rows)
+        _apply_date_format(worksheet, EXPENSES_DATE_COLS, total_rows)
 
-    # --- Currency & percentage columns ---
-    if tipo == TIPO_INGRESOS:
-        _apply_currency_format(worksheet, [INGRESOS_COL_BASE, INGRESOS_COL_IVA, INGRESOS_COL_SURCHARGE], total_rows)
-        _apply_integer_format(worksheet, INGRESOS_COL_IVA_PCT, total_rows)
+    # Currency & percentage columns
+    if sheet_type == SHEET_TYPE_INCOME:
+        _apply_currency_format(worksheet, [INCOME_COL_BASE, INCOME_COL_VAT, INCOME_COL_SURCHARGE], total_rows)
+        _apply_integer_format(worksheet, INCOME_COL_VAT_PCT, total_rows)
     else:
-        _apply_currency_format(worksheet, [GASTOS_COL_BASE, GASTOS_COL_IVA, GASTOS_COL_TOTAL], total_rows)
-        _apply_integer_format(worksheet, GASTOS_COL_IVA_PCT, total_rows)
+        _apply_currency_format(worksheet, [EXPENSES_COL_BASE, EXPENSES_COL_VAT, EXPENSES_COL_TOTAL], total_rows)
+        _apply_integer_format(worksheet, EXPENSES_COL_VAT_PCT, total_rows)
 
-    # --- Concepto column (K) in ingresos: wide + wrap ---
-    if tipo == TIPO_INGRESOS:
+    # Concept column (K) in income sheets: wide + wrap
+    if sheet_type == SHEET_TYPE_INCOME:
         wrap_fmt = CellFormat(wrapStrategy="WRAP")
         format_cell_range(worksheet, f"K{FIRST_DATA_ROW}:K{total_rows}", wrap_fmt)
 
-    # --- Row coloring by quarter (ingresos master sheet only) ---
+    # Row coloring by quarter (income master sheet only)
     # Batch all row color requests into a single API call to avoid per-row overhead.
-    if tipo == TIPO_INGRESOS and quarter_data:
+    if sheet_type == SHEET_TYPE_INCOME and quarter_data:
         color_requests: list[dict[str, Any]] = []
         for i, q in enumerate(quarter_data):
             if q == 1:  # Q1 is white (default), skip
@@ -600,10 +603,8 @@ def format_sheet(
         if color_requests:
             worksheet.spreadsheet.batch_update({"requests": color_requests})
 
-    # --- Column widths ---
+    # Column widths: auto-resize all columns first
     sheet_id = worksheet.id
-
-    # Auto-resize all columns based on content first
     auto_requests: list[dict[str, Any]] = [{
         "autoResizeDimensions": {
             "dimensions": {
@@ -616,17 +617,17 @@ def format_sheet(
     }]
     worksheet.spreadsheet.batch_update({"requests": auto_requests})
 
-    # Then override Concepto (K) with fixed width so auto-resize doesn't undo it
-    if tipo == TIPO_INGRESOS:
+    # Then override Concept (K) with fixed width so auto-resize doesn't undo it
+    if sheet_type == SHEET_TYPE_INCOME:
         fix_requests: list[dict[str, Any]] = [{
             "updateDimensionProperties": {
                 "range": {
                     "sheetId": sheet_id,
                     "dimension": "COLUMNS",
-                    "startIndex": INGRESOS_COL_CONCEPTO_IDX,
-                    "endIndex": INGRESOS_COL_CONCEPTO_IDX + 1,
+                    "startIndex": INCOME_COL_CONCEPT_IDX,
+                    "endIndex": INCOME_COL_CONCEPT_IDX + 1,
                 },
-                "properties": {"pixelSize": CONCEPTO_WIDTH_PX},
+                "properties": {"pixelSize": CONCEPT_WIDTH_PX},
                 "fields": "pixelSize",
             }
         }]
@@ -643,15 +644,15 @@ def main(year: int | None = None, spreadsheet_id: str | None = None, credentials
         year = datetime.date.today().year
 
     with create_client() as client:
-        print(f"Fetching ingresos for {year}...")
-        ingresos = _fetch_all_invoices(client, GetInvoicesFilterkind.INCOME, year)
-        print(f"  -> {len(ingresos)} facturas emitidas")
+        print(f"Fetching income invoices for {year}...")
+        income = _fetch_all_invoices(client, GetInvoicesFilterkind.INCOME, year)
+        print(f"  -> {len(income)} issued invoices")
 
-        print(f"Fetching gastos for {year}...")
-        gastos = _fetch_all_invoices(client, GetInvoicesFilterkind.EXPENSES, year)
-        print(f"  -> {len(gastos)} facturas recibidas")
+        print(f"Fetching expense invoices for {year}...")
+        expenses = _fetch_all_invoices(client, GetInvoicesFilterkind.EXPENSES, year)
+        print(f"  -> {len(expenses)} received invoices")
 
-    # --- Connect to Google Sheets ---
+    # Connect to Google Sheets
     if credentials_path:
         gc = gspread.service_account(filename=credentials_path)
     else:
@@ -678,49 +679,47 @@ def main(year: int | None = None, spreadsheet_id: str | None = None, credentials
 
     print(f"Writing to spreadsheet: {spreadsheet.title}")
 
-    # --- Build row data ---
-    ingreso_rows = [_ingreso_row(r) for r in ingresos]
-    gasto_rows = [_gasto_row(r) for r in gastos]
-    ingreso_quarters = [r["quarter"] for r in ingresos]
+    # Build row data
+    income_rows = [_income_row(r) for r in income]
+    expense_rows = [_expense_row(r) for r in expenses]
+    income_quarters = [r["quarter"] for r in income]
 
-    # --- Master sheets ---
+    # Master sheets
     sheet_configs: list[SheetConfig] = []
 
-    # Ingresos master
-    ws = _ensure_worksheet(spreadsheet, "Ingresos", len(ingreso_rows) + 1, NUM_INGRESOS_COLS)
-    write_sheet(ws, ingreso_rows, INGRESOS_HEADERS)
-    sheet_configs.append((ws, TIPO_INGRESOS, len(ingreso_rows), ingreso_quarters))
+    ws = _ensure_worksheet(spreadsheet, "Ingresos", len(income_rows) + 1, NUM_INCOME_COLS)
+    write_sheet(ws, income_rows, INCOME_HEADERS)
+    sheet_configs.append((ws, SHEET_TYPE_INCOME, len(income_rows), income_quarters))
 
-    # Gastos master
-    ws = _ensure_worksheet(spreadsheet, "Gastos", len(gasto_rows) + 1, NUM_GASTOS_COLS)
-    write_sheet(ws, gasto_rows, GASTOS_HEADERS)
-    sheet_configs.append((ws, TIPO_GASTOS, len(gasto_rows), None))
+    ws = _ensure_worksheet(spreadsheet, "Gastos", len(expense_rows) + 1, NUM_EXPENSES_COLS)
+    write_sheet(ws, expense_rows, EXPENSES_HEADERS)
+    sheet_configs.append((ws, SHEET_TYPE_EXPENSES, len(expense_rows), None))
 
-    # --- Quarterly sheets ---
+    # Quarterly sheets
     for q in range(1, NUM_QUARTERS + 1):
-        q_ingresos = filter_by_quarter(ingresos, q)
-        q_rows = [_ingreso_row(r) for r in q_ingresos]
-        ws = _ensure_worksheet(spreadsheet, f"Ingresos T{q}", len(q_rows) + 1, NUM_INGRESOS_COLS)
-        write_sheet(ws, q_rows, INGRESOS_HEADERS)
-        sheet_configs.append((ws, TIPO_INGRESOS, len(q_rows), None))
+        q_income = filter_by_quarter(income, q)
+        q_rows = [_income_row(r) for r in q_income]
+        ws = _ensure_worksheet(spreadsheet, f"Ingresos T{q}", len(q_rows) + 1, NUM_INCOME_COLS)
+        write_sheet(ws, q_rows, INCOME_HEADERS)
+        sheet_configs.append((ws, SHEET_TYPE_INCOME, len(q_rows), None))
 
-        q_gastos = filter_by_quarter(gastos, q)
-        q_rows = [_gasto_row(r) for r in q_gastos]
-        ws = _ensure_worksheet(spreadsheet, f"Gastos T{q}", len(q_rows) + 1, NUM_GASTOS_COLS)
-        write_sheet(ws, q_rows, GASTOS_HEADERS)
-        sheet_configs.append((ws, TIPO_GASTOS, len(q_rows), None))
+        q_expenses = filter_by_quarter(expenses, q)
+        q_rows = [_expense_row(r) for r in q_expenses]
+        ws = _ensure_worksheet(spreadsheet, f"Gastos T{q}", len(q_rows) + 1, NUM_EXPENSES_COLS)
+        write_sheet(ws, q_rows, EXPENSES_HEADERS)
+        sheet_configs.append((ws, SHEET_TYPE_EXPENSES, len(q_rows), None))
 
-    # --- Remove default "Sheet1" if it exists ---
+    # Remove default "Sheet1" if it exists
     try:
         default_sheet = spreadsheet.worksheet("Sheet1")
         spreadsheet.del_worksheet(default_sheet)
     except gspread.WorksheetNotFound:
         pass
 
-    # --- Apply formatting to all sheets ---
+    # Apply formatting to all sheets
     print("Applying formatting...")
-    for ws, tipo, num_rows, quarters in sheet_configs:
-        format_sheet(ws, tipo, num_rows, quarters)
+    for ws, sheet_type, num_rows, quarters in sheet_configs:
+        format_sheet(ws, sheet_type, num_rows, quarters)
 
     print("Done!")
 
