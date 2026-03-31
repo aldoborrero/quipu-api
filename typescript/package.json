@@ -1,0 +1,16 @@
+{
+  "name": "quipu-api-client",
+  "version": "1.0.0",
+  "description": "TypeScript client for the Quipu API",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^5.0"
+  },
+  "license": "MIT"
+}

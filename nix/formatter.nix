@@ -27,6 +27,10 @@ let
 
     # python
     programs.ruff-format.enable = true;
+
+    # typescript
+    programs.prettier.enable = true;
+    programs.prettier.includes = [ "typescript/**/*.ts" ];
   };
 in
 treefmt.config.build.wrapper
