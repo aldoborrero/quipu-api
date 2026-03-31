@@ -29,7 +29,7 @@ from quipu_client.api.invoices import get_invoices
 from quipu_client.client import Client
 from quipu_client.models.get_invoices_filterkind import GetInvoicesFilterkind
 from quipu_client.models.get_invoices_include import GetInvoicesInclude
-from quipu_client.types import UNSET, Unset
+from quipu_client.types import Unset
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -475,8 +475,7 @@ def _ensure_worksheet(spreadsheet: gspread.Spreadsheet, title: str, rows: int, c
 def write_sheet(worksheet: gspread.Worksheet, rows: list[list[Any]], headers: list[str]) -> None:
     """Write headers + data rows to the worksheet."""
     all_data: list[list[Any]] = [headers] + rows
-    if all_data:
-        worksheet.update(all_data, value_input_option="RAW")
+    worksheet.update(all_data, value_input_option="RAW")
 
 
 def _apply_date_format(worksheet: gspread.Worksheet, cols: list[str], total_rows: int) -> None:
@@ -643,13 +642,14 @@ def main(year: int | None = None, spreadsheet_id: str | None = None, credentials
     if year is None:
         year = datetime.date.today().year
 
-    print(f"Fetching ingresos for {year}...")
-    ingresos = fetch_ingresos(year)
-    print(f"  -> {len(ingresos)} facturas emitidas")
+    with create_client() as client:
+        print(f"Fetching ingresos for {year}...")
+        ingresos = _fetch_all_invoices(client, GetInvoicesFilterkind.INCOME, year)
+        print(f"  -> {len(ingresos)} facturas emitidas")
 
-    print(f"Fetching gastos for {year}...")
-    gastos = fetch_gastos(year)
-    print(f"  -> {len(gastos)} facturas recibidas")
+        print(f"Fetching gastos for {year}...")
+        gastos = _fetch_all_invoices(client, GetInvoicesFilterkind.EXPENSES, year)
+        print(f"  -> {len(gastos)} facturas recibidas")
 
     # --- Connect to Google Sheets ---
     if credentials_path:
