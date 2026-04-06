@@ -75,7 +75,6 @@ from .get_tickets_filterpayment_status import GetTicketsFilterpaymentStatus
 from .get_tickets_include import GetTicketsInclude
 from .invoice_attributes import InvoiceAttributes
 from .invoice_attributes_kind import InvoiceAttributesKind
-from .invoice_attributes_payment_method import InvoiceAttributesPaymentMethod
 from .invoice_attributes_payment_status import InvoiceAttributesPaymentStatus
 from .invoice_attributes_validation_status import InvoiceAttributesValidationStatus
 from .invoice_collection import InvoiceCollection
@@ -142,7 +141,6 @@ from .pagination_meta_meta import PaginationMetaMeta
 from .pagination_meta_meta_pagination_info import PaginationMetaMetaPaginationInfo
 from .paysheet_attributes import PaysheetAttributes
 from .paysheet_attributes_kind import PaysheetAttributesKind
-from .paysheet_attributes_payment_method import PaysheetAttributesPaymentMethod
 from .paysheet_attributes_payment_status import PaysheetAttributesPaymentStatus
 from .paysheet_collection import PaysheetCollection
 from .paysheet_create import PaysheetCreate
@@ -180,7 +178,6 @@ from .paysheet_update_data import PaysheetUpdateData
 from .paysheet_update_data_type import PaysheetUpdateDataType
 from .ticket_attributes import TicketAttributes
 from .ticket_attributes_kind import TicketAttributesKind
-from .ticket_attributes_payment_method import TicketAttributesPaymentMethod
 from .ticket_attributes_payment_status import TicketAttributesPaymentStatus
 from .ticket_attributes_validation_status import TicketAttributesValidationStatus
 from .ticket_collection import TicketCollection
@@ -293,7 +290,6 @@ __all__ = (
     "GetTicketsInclude",
     "InvoiceAttributes",
     "InvoiceAttributesKind",
-    "InvoiceAttributesPaymentMethod",
     "InvoiceAttributesPaymentStatus",
     "InvoiceAttributesValidationStatus",
     "InvoiceCollection",
@@ -356,7 +352,6 @@ __all__ = (
     "PaginationMetaMetaPaginationInfo",
     "PaysheetAttributes",
     "PaysheetAttributesKind",
-    "PaysheetAttributesPaymentMethod",
     "PaysheetAttributesPaymentStatus",
     "PaysheetCollection",
     "PaysheetCreate",
@@ -386,7 +381,6 @@ __all__ = (
     "PaysheetUpdateDataType",
     "TicketAttributes",
     "TicketAttributesKind",
-    "TicketAttributesPaymentMethod",
     "TicketAttributesPaymentStatus",
     "TicketAttributesValidationStatus",
     "TicketCollection",

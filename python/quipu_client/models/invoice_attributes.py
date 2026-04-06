@@ -9,7 +9,6 @@ from attrs import field as _attrs_field
 from dateutil.parser import isoparse
 
 from ..models.invoice_attributes_kind import InvoiceAttributesKind
-from ..models.invoice_attributes_payment_method import InvoiceAttributesPaymentMethod
 from ..models.invoice_attributes_payment_status import InvoiceAttributesPaymentStatus
 from ..models.invoice_attributes_validation_status import InvoiceAttributesValidationStatus
 from ..types import UNSET, Unset
@@ -26,7 +25,7 @@ class InvoiceAttributes:
         issue_date (datetime.date | Unset):
         due_dates (list[datetime.date] | Unset):
         paid_at (datetime.date | None | Unset):
-        payment_method (InvoiceAttributesPaymentMethod | Unset):
+        payment_method (None | str | Unset):
         payment_status (InvoiceAttributesPaymentStatus | Unset):
         validation_status (InvoiceAttributesValidationStatus | Unset):
         total_amount (str | Unset):
@@ -59,7 +58,7 @@ class InvoiceAttributes:
     issue_date: datetime.date | Unset = UNSET
     due_dates: list[datetime.date] | Unset = UNSET
     paid_at: datetime.date | None | Unset = UNSET
-    payment_method: InvoiceAttributesPaymentMethod | Unset = UNSET
+    payment_method: None | str | Unset = UNSET
     payment_status: InvoiceAttributesPaymentStatus | Unset = UNSET
     validation_status: InvoiceAttributesValidationStatus | Unset = UNSET
     total_amount: str | Unset = UNSET
@@ -113,9 +112,11 @@ class InvoiceAttributes:
         else:
             paid_at = self.paid_at
 
-        payment_method: str | Unset = UNSET
-        if not isinstance(self.payment_method, Unset):
-            payment_method = self.payment_method.value
+        payment_method: None | str | Unset
+        if isinstance(self.payment_method, Unset):
+            payment_method = UNSET
+        else:
+            payment_method = self.payment_method
 
         payment_status: str | Unset = UNSET
         if not isinstance(self.payment_status, Unset):
@@ -284,12 +285,14 @@ class InvoiceAttributes:
 
         paid_at = _parse_paid_at(d.pop("paid_at", UNSET))
 
-        _payment_method = d.pop("payment_method", UNSET)
-        payment_method: InvoiceAttributesPaymentMethod | Unset
-        if isinstance(_payment_method, Unset):
-            payment_method = UNSET
-        else:
-            payment_method = InvoiceAttributesPaymentMethod(_payment_method)
+        def _parse_payment_method(data: object) -> None | str | Unset:
+            if data is None:
+                return data
+            if isinstance(data, Unset):
+                return data
+            return cast(None | str | Unset, data)
+
+        payment_method = _parse_payment_method(d.pop("payment_method", UNSET))
 
         _payment_status = d.pop("payment_status", UNSET)
         payment_status: InvoiceAttributesPaymentStatus | Unset

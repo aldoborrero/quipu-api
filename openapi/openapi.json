@@ -1882,15 +1882,7 @@
           },
           "payment_method": {
             "type": "string",
-            "enum": [
-              "cash",
-              "bank_transfer",
-              "bank_card",
-              "direct_debit",
-              "paypal",
-              "check",
-              "factoring"
-            ]
+            "nullable": true
           },
           "payment_status": {
             "type": "string",
@@ -2333,15 +2325,7 @@
           },
           "payment_method": {
             "type": "string",
-            "enum": [
-              "cash",
-              "bank_transfer",
-              "bank_card",
-              "direct_debit",
-              "paypal",
-              "check",
-              "factoring"
-            ]
+            "nullable": true
           },
           "payment_status": {
             "type": "string",
@@ -2757,15 +2741,7 @@
           },
           "payment_method": {
             "type": "string",
-            "enum": [
-              "cash",
-              "bank_transfer",
-              "bank_card",
-              "direct_debit",
-              "paypal",
-              "check",
-              "factoring"
-            ]
+            "nullable": true
           },
           "payment_status": {
             "type": "string",
