@@ -33,6 +33,7 @@ from gspread_formatting import (
     CellFormat,
     Color,
     NumberFormat,
+    TextFormat,
     format_cell_ranges,
 )
 
@@ -508,6 +509,127 @@ def filter_by_quarter(entries: list[InvoiceRecord], quarter: int) -> list[Invoic
 
 
 # ---------------------------------------------------------------------------
+# Tax form aggregation helpers
+# ---------------------------------------------------------------------------
+
+
+def _computable_income_base(invoice: InvoiceRecord) -> Decimal:
+    """Pre-VAT base of an income invoice for Modelo 130 casilla 01.
+
+    Excludes reimbursement line items (pass-through). Rectificativas are
+    already returned by Quipu with negative base/line-item amounts, so no
+    manual sign flip is needed — we just sum what the API gives us.
+    Falls back to the invoice-level base when line items are absent.
+    """
+    line_items: list[LineItem] = invoice.get("line_items") or []
+    if line_items:
+        return sum(
+            (li.base for li in line_items if li.kind != "reimbursement"),
+            start=ZERO,
+        )
+    return invoice.get("base") or ZERO
+
+
+def _deductible_expense_base(invoice: InvoiceRecord) -> Decimal:
+    """Pre-VAT deductible base of an expense invoice for Modelo 130 casilla 02.
+
+    Honors each line's deductible_expense_percent. Excludes reimbursements.
+    Assets are included at 100% as a simplification — real amortization goes in
+    the annual declaration, not the quarterly payment fractionado.
+    """
+    line_items: list[LineItem] = invoice.get("line_items") or []
+    if line_items:
+        return sum(
+            (
+                li.base * li.deductible_expense_percent / HUNDRED
+                for li in line_items
+                if li.kind != "reimbursement"
+            ),
+            start=ZERO,
+        )
+    return invoice.get("base") or ZERO
+
+
+def _income_retentions(invoice: InvoiceRecord) -> Decimal:
+    """IRPF withholdings the client applied to an income invoice (casilla 06)."""
+    return invoice.get("retention_amount") or ZERO
+
+
+@dataclass
+class Modelo130Quarter:
+    """Computed Modelo 130 values for one quarter (all cumulative except *_periodo)."""
+
+    quarter: int
+    ingresos_periodo: Decimal     # delta for this quarter
+    gastos_periodo: Decimal       # delta for this quarter
+    retenciones_periodo: Decimal  # delta for this quarter
+    ingresos_acum: Decimal        # casilla 01
+    gastos_acum: Decimal          # casilla 02
+    rendimiento_neto: Decimal     # casilla 03 = 01 - 02
+    casilla_04: Decimal           # 20% of casilla 03 (floored at 0)
+    casilla_05: Decimal           # sum of positive casilla 07 from previous quarters
+    retenciones_acum: Decimal     # casilla 06
+    casilla_07: Decimal           # 04 - 05 - 06 (can be negative)
+
+
+def compute_modelo_130(
+    income: list[InvoiceRecord],
+    expenses: list[InvoiceRecord],
+) -> list[Modelo130Quarter]:
+    """Compute Modelo 130 values for all four quarters of a year.
+
+    Returns a list of four Modelo130Quarter (one per T1..T4), with casilla 05
+    threaded forward from prior quarters' positive casilla 07 values.
+    """
+    result: list[Modelo130Quarter] = []
+    prior_positive_07 = ZERO  # running sum for casilla 05
+    twenty_percent = Decimal("0.20")
+
+    for q in range(1, NUM_QUARTERS + 1):
+        q_income = filter_by_quarter(income, q)
+        q_expenses = filter_by_quarter(expenses, q)
+
+        ingresos_periodo = sum((_computable_income_base(r) for r in q_income), start=ZERO)
+        gastos_periodo = sum((_deductible_expense_base(r) for r in q_expenses), start=ZERO)
+        retenciones_periodo = sum((_income_retentions(r) for r in q_income), start=ZERO)
+
+        if result:
+            prev = result[-1]
+            ingresos_acum = prev.ingresos_acum + ingresos_periodo
+            gastos_acum = prev.gastos_acum + gastos_periodo
+            retenciones_acum = prev.retenciones_acum + retenciones_periodo
+        else:
+            ingresos_acum = ingresos_periodo
+            gastos_acum = gastos_periodo
+            retenciones_acum = retenciones_periodo
+
+        rendimiento_neto = ingresos_acum - gastos_acum
+        casilla_04 = max(rendimiento_neto, ZERO) * twenty_percent
+        casilla_05 = prior_positive_07
+        casilla_07 = casilla_04 - casilla_05 - retenciones_acum
+
+        result.append(Modelo130Quarter(
+            quarter=q,
+            ingresos_periodo=ingresos_periodo,
+            gastos_periodo=gastos_periodo,
+            retenciones_periodo=retenciones_periodo,
+            ingresos_acum=ingresos_acum,
+            gastos_acum=gastos_acum,
+            rendimiento_neto=rendimiento_neto,
+            casilla_04=casilla_04,
+            casilla_05=casilla_05,
+            retenciones_acum=retenciones_acum,
+            casilla_07=casilla_07,
+        ))
+
+        # Thread casilla 05 forward: only positive results count.
+        if casilla_07 > 0:
+            prior_positive_07 += casilla_07
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Build row data
 # ---------------------------------------------------------------------------
 
@@ -782,7 +904,171 @@ def main(year: int | None = None, spreadsheet_id: str | None = None, credentials
         format_sheet(ws, sheet_type, len(rows), quarters)
         time.sleep(1.0)  # stay under Sheets API write quota (60/min/user)
 
+    # Step 5: modelo summary sheets
+    print("Writing modelo summary sheets...")
+    m130_quarters = compute_modelo_130(income, expenses)
+    write_modelo_sheet(spreadsheet, "Modelo 130", _modelo_130_rows(m130_quarters))
+    time.sleep(1.0)
+
     print("Done!")
+
+
+# ---------------------------------------------------------------------------
+# Modelo summary sheets
+# ---------------------------------------------------------------------------
+
+MODELO_WARNING: str = (
+    "Estos valores son una aproximación derivada de los datos de Quipu. "
+    "Verificar con tu gestor antes de presentar."
+)
+
+WARNING_FMT = CellFormat(
+    backgroundColor=Color(1, 0.949, 0.8),  # pale yellow
+    textFormat=TextFormat(bold=True, foregroundColor=Color(0.4, 0.2, 0)),
+    horizontalAlignment="LEFT",
+    wrapStrategy="WRAP",
+)
+SECTION_FMT = CellFormat(
+    backgroundColor=Color(0.93, 0.93, 0.93),
+    textFormat=TextFormat(bold=True),
+    horizontalAlignment="LEFT",
+)
+TOTAL_FMT = CellFormat(textFormat=TextFormat(bold=True))
+MODELO_HEADER_FMT = CellFormat(
+    backgroundColor=Color(0.827, 0.827, 0.827),
+    textFormat=TextFormat(bold=True),
+    horizontalAlignment="CENTER",
+)
+# Locale-aware currency format that shows 0 as a dash.
+MODELO_CURRENCY_FMT = CellFormat(
+    numberFormat=NumberFormat(type="CURRENCY", pattern='#,##0.00 [$€];-#,##0.00 [$€];"-"'),
+    horizontalAlignment="RIGHT",
+)
+
+
+@dataclass
+class ModeloRow:
+    """One row in a modelo summary sheet."""
+
+    label: str
+    values: list[Decimal] | None = None  # None for section headers / blank rows
+    bold: bool = False
+    section: bool = False
+
+
+def _modelo_130_rows(quarters: list[Modelo130Quarter]) -> list[ModeloRow]:
+    """Build the displayable rows for the Modelo 130 sheet."""
+
+    def col_values(attr: str) -> list[Decimal]:
+        """[T1, T2, T3, T4, Anual] for a per-period attribute (sum = annual)."""
+        vals: list[Decimal] = [getattr(q, attr) for q in quarters]
+        return vals + [sum(vals, start=ZERO)]
+
+    def cumulative_values(attr: str) -> list[Decimal]:
+        """[T1, T2, T3, T4, Anual] for a cumulative attribute (Anual = T4)."""
+        vals: list[Decimal] = [getattr(q, attr) for q in quarters]
+        return vals + [vals[-1]]
+
+    def casilla_07_values() -> list[Decimal]:
+        vals: list[Decimal] = [q.casilla_07 for q in quarters]
+        return vals + [sum(vals, start=ZERO)]  # annual = total paid across the year
+
+    return [
+        ModeloRow("Por período (delta del trimestre)", section=True),
+        ModeloRow("Ingresos del período (base)", col_values("ingresos_periodo")),
+        ModeloRow("Gastos del período (base deducible)", col_values("gastos_periodo")),
+        ModeloRow("Retenciones soportadas del período", col_values("retenciones_periodo")),
+        ModeloRow(""),
+
+        ModeloRow("Casillas del modelo (acumulado)", section=True),
+        ModeloRow("01  Ingresos computables", cumulative_values("ingresos_acum"), bold=True),
+        ModeloRow("02  Gastos deducibles", cumulative_values("gastos_acum"), bold=True),
+        ModeloRow("03  Rendimiento neto (01 - 02)", cumulative_values("rendimiento_neto"), bold=True),
+        ModeloRow("04  20 % de casilla 03", cumulative_values("casilla_04")),
+        ModeloRow("05  Pagos fraccionados anteriores", cumulative_values("casilla_05")),
+        ModeloRow("06  Retenciones acumuladas", cumulative_values("retenciones_acum")),
+        ModeloRow("07  Resultado (04 - 05 - 06)", casilla_07_values(), bold=True),
+        ModeloRow(""),
+
+        ModeloRow("No aplicados en este resumen", section=True),
+        ModeloRow(
+            "08–19 Minoraciones, rentas bajas, familia numerosa, "
+            "actividades agrícolas/ganaderas/forestales/pesqueras"
+        ),
+    ]
+
+
+def write_modelo_sheet(
+    spreadsheet: gspread.Spreadsheet,
+    title: str,
+    rows: list[ModeloRow],
+    value_cols: int = 5,  # T1, T2, T3, T4, Anual
+) -> None:
+    """Write a generic modelo summary sheet (not a native table).
+
+    Layout:
+        Row 1: warning banner (merged across all columns)
+        Row 2: blank
+        Row 3: column headers
+        Row 4+: ModeloRow entries
+    """
+    total_cols = 1 + value_cols  # label + values
+    num_rows = 3 + len(rows)
+
+    ws = _ensure_worksheet(spreadsheet, title, num_rows, total_cols)
+
+    # Build the raw 2-D data
+    data: list[list[Any]] = [[""] * total_cols for _ in range(num_rows)]
+    data[0][0] = MODELO_WARNING
+    headers = ["Concepto"] + [f"T{i + 1}" for i in range(value_cols - 1)] + ["Anual"]
+    data[2] = headers
+    for i, row in enumerate(rows):
+        r = 3 + i
+        data[r][0] = row.label
+        if row.values is not None:
+            for j, v in enumerate(row.values):
+                # Convert Decimal → float at the Sheets write boundary.
+                data[r][1 + j] = _money(v)
+
+    ws.update(data, value_input_option="RAW")
+
+    # Merge the warning row across all columns.
+    last_col_letter = _col_letter(total_cols)
+    spreadsheet.batch_update({"requests": [
+        {"mergeCells": {
+            "range": {
+                "sheetId": ws.id,
+                "startRowIndex": 0, "endRowIndex": 1,
+                "startColumnIndex": 0, "endColumnIndex": total_cols,
+            },
+            "mergeType": "MERGE_ALL",
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "ROWS", "startIndex": 0, "endIndex": 1},
+            "properties": {"pixelSize": 42},
+            "fields": "pixelSize",
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
+            "properties": {"pixelSize": 340},
+            "fields": "pixelSize",
+        }},
+    ]})
+
+    # Formatting: warning, headers, per-row styles, currency on value cells.
+    fmt_pairs: list[tuple[str, CellFormat]] = [
+        (f"A1:{last_col_letter}1", WARNING_FMT),
+        (f"A3:{last_col_letter}3", MODELO_HEADER_FMT),
+        (f"B4:{last_col_letter}{num_rows}", MODELO_CURRENCY_FMT),
+    ]
+    for i, row in enumerate(rows):
+        r = 4 + i
+        if row.section:
+            fmt_pairs.append((f"A{r}:{last_col_letter}{r}", SECTION_FMT))
+        elif row.bold:
+            fmt_pairs.append((f"A{r}:{last_col_letter}{r}", TOTAL_FMT))
+
+    format_cell_ranges(ws, fmt_pairs)
 
 
 def _fetch_tables_by_sheet(spreadsheet: gspread.Spreadsheet) -> dict[int, list[int | str]]:
