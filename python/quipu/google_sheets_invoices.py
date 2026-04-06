@@ -133,6 +133,26 @@ SHEETS_EPOCH: datetime.date = datetime.date(1899, 12, 30)  # Google Sheets seria
 InvoiceRecord = dict[str, Any]
 
 
+@dataclass
+class LineItem:
+    """Per-line-item data needed for tax form aggregations.
+
+    Base is the line's pre-tax amount (unitary * qty - discount). VAT and
+    retention amounts are the actual EUR values on that line. Deductible
+    percentages default to 100% when Quipu doesn't set them.
+    """
+
+    description: str
+    base: float
+    vat_percent: float
+    vat_amount: float
+    retention_amount: float
+    deductible_vat_percent: float     # 0-100
+    deductible_expense_percent: float  # 0-100
+    kind: str                          # "current" | "assets" | "reimbursement"
+    surcharge_amount: float            # equivalence surcharge (from additional_properties)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -199,55 +219,68 @@ def _money(val: float | None) -> float:
 # ---------------------------------------------------------------------------
 
 
-def _extract_item_data(
-    items_map: dict[str, Any],
-    item_ref: Any,
-) -> tuple[str | None, float | None, float | None]:
-    """Extract concept, vat_percent, and surcharge from an included line item.
+def _attr(item_attrs: Any, additional: dict[str, Any], *names: str) -> Any:
+    """Return the first non-empty value from item_attrs.<name> or additional[name]."""
+    for name in names:
+        raw = getattr(item_attrs, name, None)
+        val = _val(raw) if raw is not None else additional.get(name)
+        if val not in (None, ""):
+            return val
+    return None
 
-    Returns:
-        (concept, vat_percent, surcharge_amount) -- any may be None.
-    """
-    item_id = getattr(item_ref, "id", None)
+
+def _extract_line_item(items_map: dict[str, Any], item_ref: Any) -> LineItem | None:
+    """Build a LineItem from an included-item reference, or None if not resolvable."""
+    # The item id lives in the reference's additional_properties (not as a typed attr).
+    ref_additional: dict[str, Any] = getattr(item_ref, "additional_properties", {}) or {}
+    item_id = ref_additional.get("id") or getattr(item_ref, "id", None)
     if item_id is None or str(item_id) not in items_map:
-        return None, None, None
+        return None
 
-    item_obj = items_map[str(item_id)]
-    item_attrs = getattr(item_obj, "attributes", None)
+    item_attrs = getattr(items_map[str(item_id)], "attributes", None)
     if item_attrs is None:
-        return None, None, None
+        return None
 
-    additional: dict[str, Any] = getattr(item_attrs, "additional_properties", {})
+    additional: dict[str, Any] = getattr(item_attrs, "additional_properties", {}) or {}
 
-    # Concept text
-    concept: str | None = None
-    for field in ("concept", "description"):
-        raw = getattr(item_attrs, field, None)
-        val = _val(raw) if raw is not None else additional.get(field)
-        if val:
-            concept = str(val)
-            break
+    description = str(_attr(item_attrs, additional, "concept", "description") or "")
 
-    # VAT percent
-    vat_pct: float | None = None
-    raw_vp = getattr(item_attrs, "vat_percent", None)
-    vp_val = _val(raw_vp) if raw_vp is not None else additional.get("vat_percent")
-    if vp_val is not None:
-        try:
-            vat_pct = float(vp_val)
-        except (ValueError, TypeError):
-            pass
+    # Base: prefer explicit line base; else unitary * quantity (minus discount).
+    unitary = _to_float(_attr(item_attrs, additional, "unitary_amount")) or 0.0
+    quantity = _to_float(_attr(item_attrs, additional, "quantity")) or 0.0
+    discount_amount = _to_float(_attr(item_attrs, additional, "discount_amount")) or 0.0
+    discount_pct = _to_float(_attr(item_attrs, additional, "discount_percent")) or 0.0
+    gross_base = unitary * quantity
+    if discount_amount:
+        base = gross_base - discount_amount
+    else:
+        base = gross_base * (1 - discount_pct / 100)
 
-    # Equivalence surcharge
-    surcharge: float | None = None
-    raw_sur = additional.get("equivalence_surcharge_amount") or additional.get("surcharge_amount")
-    if raw_sur is not None:
-        try:
-            surcharge = float(raw_sur)
-        except (ValueError, TypeError):
-            pass
+    vat_percent = _to_float(_attr(item_attrs, additional, "vat_percent")) or 0.0
+    vat_amount = _to_float(_attr(item_attrs, additional, "vat_amount")) or 0.0
+    retention_amount = _to_float(_attr(item_attrs, additional, "retention_amount")) or 0.0
 
-    return concept, vat_pct, surcharge
+    # Deductibility defaults to 100% when unset (most line items are fully deductible).
+    deductible_vat_pct = _to_float(_attr(item_attrs, additional, "deductible_vat_percent"))
+    deductible_expense_pct = _to_float(_attr(item_attrs, additional, "deductible_expense_percent"))
+
+    kind_raw = _attr(item_attrs, additional, "kind")
+    kind = str(kind_raw.value if hasattr(kind_raw, "value") else kind_raw or "current")
+
+    surcharge_raw = additional.get("equivalence_surcharge_amount") or additional.get("surcharge_amount")
+    surcharge_amount = _to_float(surcharge_raw) or 0.0
+
+    return LineItem(
+        description=description,
+        base=base,
+        vat_percent=vat_percent,
+        vat_amount=vat_amount,
+        retention_amount=retention_amount,
+        deductible_vat_percent=deductible_vat_pct if deductible_vat_pct is not None else 100.0,
+        deductible_expense_percent=deductible_expense_pct if deductible_expense_pct is not None else 100.0,
+        kind=kind,
+        surcharge_amount=surcharge_amount,
+    )
 
 
 def _infer_vat_percent(
@@ -303,22 +336,15 @@ def _fetch_all_invoices(client: Client, kind: GetInvoicesFilterkind, year: int) 
 
                 rels = inv.relationships if not isinstance(inv.relationships, Unset) else None
 
-                # Gather line-item data
-                item_concepts: list[str] = []
-                item_vat_percents: list[float] = []
-                item_surcharges: list[float] = []
-
+                # Gather line items
+                line_items: list[LineItem] = []
                 if rels and not isinstance(rels.items, Unset) and rels.items:
                     items_data = _val(rels.items.data)
                     if items_data:
                         for item_ref in items_data:
-                            concept, vat_pct, surcharge = _extract_item_data(items_map, item_ref)
-                            if concept:
-                                item_concepts.append(concept)
-                            if vat_pct is not None:
-                                item_vat_percents.append(vat_pct)
-                            if surcharge is not None:
-                                item_surcharges.append(surcharge)
+                            li = _extract_line_item(items_map, item_ref)
+                            if li is not None:
+                                line_items.append(li)
 
                 # Determine if this is an amending (rectificative) invoice
                 is_amending = False
@@ -334,9 +360,12 @@ def _fetch_all_invoices(client: Client, kind: GetInvoicesFilterkind, year: int) 
                 base = _to_float(attrs.total_amount_without_taxes)
                 vat_amount = _to_float(attrs.vat_amount)
                 total = _to_float(attrs.total_amount)
+                retention_amount = _to_float(attrs.retention_amount) or 0.0
 
+                item_vat_percents = [li.vat_percent for li in line_items if li.vat_percent]
                 vat_pct_value = _infer_vat_percent(item_vat_percents, vat_amount, base)
-                surcharge_total = sum(item_surcharges) if item_surcharges else 0.0
+                surcharge_total = sum(li.surcharge_amount for li in line_items)
+                concept = " | ".join(li.description for li in line_items if li.description)
 
                 # For issued invoices: the recipient is the client
                 # For received invoices: the issuer is the supplier
@@ -344,6 +373,7 @@ def _fetch_all_invoices(client: Client, kind: GetInvoicesFilterkind, year: int) 
                     contact_name = _val(attrs.recipient_name) or ""
                     contact_tax_id = _val(attrs.recipient_tax_id) or ""
                     contact_zip = _val(attrs.recipient_zip_code) or ""
+                    country_code = (_val(attrs.recipient_country_code) or "").upper()
                     contact_account = ""
                     if rels and not isinstance(rels.accounting_subcategory, Unset) and rels.accounting_subcategory:
                         sub_data = _val(rels.accounting_subcategory.data)
@@ -353,6 +383,7 @@ def _fetch_all_invoices(client: Client, kind: GetInvoicesFilterkind, year: int) 
                     contact_name = _val(attrs.issuing_name) or ""
                     contact_tax_id = _val(attrs.issuing_tax_id) or ""
                     contact_zip = _val(attrs.issuing_zip_code) or ""
+                    country_code = (_val(attrs.issuing_country_code) or "").upper()
                     contact_account = ""
 
                 record: InvoiceRecord = {
@@ -366,15 +397,18 @@ def _fetch_all_invoices(client: Client, kind: GetInvoicesFilterkind, year: int) 
                     "contact_account": contact_account,
                     "contact_tax_id": contact_tax_id,
                     "contact_zip": contact_zip,
-                    "concept": " | ".join(item_concepts) if item_concepts else "",
+                    "country_code": country_code,
+                    "concept": concept,
                     "payment_status": _payment_status_label(attrs.payment_status),
                     "is_amending": is_amending,
                     "base": base,
                     "vat_amount": vat_amount,
                     "vat_pct": vat_pct_value,
                     "surcharge": surcharge_total,
+                    "retention_amount": retention_amount,
                     "total": total,
                     "quarter": _get_quarter(issue_date) if issue_date else 0,
+                    "line_items": line_items,
                 }
                 all_invoices.append(record)
 
