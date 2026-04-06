@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
@@ -144,6 +145,21 @@ NUM_QUARTERS: int = 4
 FIRST_DATA_ROW: int = 2  # 1-indexed row where data starts (after header)
 SHEETS_EPOCH: datetime.date = datetime.date(1899, 12, 30)  # Google Sheets serial date epoch
 
+# Home country for operation classification. The autónomo files Modelo 303/130
+# from Spain, so counterparties with this country are "national".
+HOME_COUNTRY_CODE: str = "ES"
+
+# Default rate used to self-assess VAT on reverse-charge transactions (intra-EU
+# acquisitions and non-EU services under art. 84.1.2º LIVA). Most goods and
+# services fall under 21 %; a gestor can override via the CLI.
+SELF_ASSESS_INTRA_EU_RATE: Decimal = Decimal("21")
+
+# Quipu ItemAttributesKind values. Treated as magic strings across the codebase
+# today; extracted here so a rename in Quipu surfaces as a single compile error.
+KIND_CURRENT: str = "current"
+KIND_ASSETS: str = "assets"
+KIND_REIMBURSEMENT: str = "reimbursement"
+
 # ISO 3166-1 alpha-2 codes for EU member states (as of 2026). ES is the home
 # country and is classified as "national" rather than "intra_eu".
 EU_COUNTRY_CODES: frozenset[str] = frozenset({
@@ -241,7 +257,7 @@ def classify_operation(country_code: str | None) -> str:
     if not country_code:
         return OP_NATIONAL
     code = country_code.upper()
-    if code == "ES":
+    if code == HOME_COUNTRY_CODE:
         return OP_NATIONAL
     if code in EU_COUNTRY_CODES:
         return OP_INTRA_EU
@@ -322,7 +338,7 @@ def _extract_line_item(items_map: dict[str, Any], item_ref: Any) -> LineItem | N
     deductible_expense_pct = _to_decimal(_attr(item_attrs, additional, "deductible_expense_percent"))
 
     kind_raw = _attr(item_attrs, additional, "kind")
-    kind = str(kind_raw.value if hasattr(kind_raw, "value") else kind_raw or "current")
+    kind = str(kind_raw.value if hasattr(kind_raw, "value") else kind_raw or KIND_CURRENT)
 
     surcharge_raw = additional.get("equivalence_surcharge_amount") or additional.get("surcharge_amount")
     surcharge_amount = _to_decimal(surcharge_raw) or ZERO
@@ -524,7 +540,7 @@ def _computable_income_base(invoice: InvoiceRecord) -> Decimal:
     line_items: list[LineItem] = invoice.get("line_items") or []
     if line_items:
         return sum(
-            (li.base for li in line_items if li.kind != "reimbursement"),
+            (li.base for li in line_items if li.kind != KIND_REIMBURSEMENT),
             start=ZERO,
         )
     return invoice.get("base") or ZERO
@@ -543,7 +559,7 @@ def _deductible_expense_base(invoice: InvoiceRecord) -> Decimal:
             (
                 li.base * li.deductible_expense_percent / HUNDRED
                 for li in line_items
-                if li.kind != "reimbursement"
+                if li.kind != KIND_REIMBURSEMENT
             ),
             start=ZERO,
         )
@@ -630,8 +646,234 @@ def compute_modelo_130(
 
 
 # ---------------------------------------------------------------------------
-# Build row data
+# Modelo 303 (IVA trimestral)
 # ---------------------------------------------------------------------------
+
+
+@dataclass
+class BaseCuota:
+    """A (base imponible, cuota IVA) pair. Mutable so aggregation is in place."""
+    base: Decimal = ZERO
+    cuota: Decimal = ZERO
+
+    def add(self, base: Decimal, cuota: Decimal) -> None:
+        self.base += base
+        self.cuota += cuota
+
+
+@dataclass
+class Modelo303Quarter:
+    """Computed Modelo 303 values for one quarter (per-quarter, not cumulative)."""
+
+    quarter: int
+    # --- IVA devengado (repercutido) ---
+    # National sales (régimen general) bucketed by VAT rate: casillas 1-9.
+    national_rep: dict[Decimal, BaseCuota]
+    # Adquisiciones intracomunitarias de bienes y servicios (UE, self-assessed):
+    # casillas 10-11.
+    intra_eu_acq: dict[Decimal, BaseCuota]
+    # Otras operaciones con inversión del sujeto pasivo (excepto adq. intracom):
+    # casillas 12-13. Non-EU services with VAT=0 are self-assessed here via
+    # art. 84.1.2º LIVA ("reverse charge by localization rule").
+    isp_other: dict[Decimal, BaseCuota]
+    # Intra-EU deliveries exentas: casilla 59.
+    intra_eu_deliveries: Decimal
+    # Exportaciones de bienes: casilla 60. (Kept as a row even if unused so the
+    # structure is visible for future goods-export cases.)
+    exports_goods: Decimal
+    # No sujetas por reglas de localización con derecho a deducción: casilla 120.
+    # Services to non-EU businesses go here, not in casilla 60.
+    no_sujetas_loc: Decimal
+
+    # --- IVA soportado (deducible) ---
+    # Cuotas are already scaled by deductible_vat_percent.
+    # IMPORTANT: nat_current / nat_assets include both domestic purchases and
+    # the self-assessed side of non-EU service reverse-charge transactions —
+    # that's how the AEAT form expects them to be reported (casillas 28-31).
+    nat_current: BaseCuota   # casillas 28-29
+    nat_assets: BaseCuota    # casillas 30-31
+    imp_current: BaseCuota   # casillas 32-33 (physical imports with customs VAT)
+    imp_assets: BaseCuota    # casillas 34-35
+    eu_current: BaseCuota    # casillas 36-37 (intra-EU acquisitions)
+    eu_assets: BaseCuota     # casillas 38-39
+
+    @property
+    def total_devengado(self) -> Decimal:
+        total = ZERO
+        for bc in self.national_rep.values():
+            total += bc.cuota
+        for bc in self.intra_eu_acq.values():
+            total += bc.cuota
+        for bc in self.isp_other.values():
+            total += bc.cuota
+        return total
+
+    @property
+    def total_deducible(self) -> Decimal:
+        return (
+            self.nat_current.cuota + self.nat_assets.cuota
+            + self.imp_current.cuota + self.imp_assets.cuota
+            + self.eu_current.cuota + self.eu_assets.cuota
+        )
+
+    @property
+    def resultado(self) -> Decimal:
+        return self.total_devengado - self.total_deducible
+
+
+def _empty_modelo_303_quarter(quarter: int) -> Modelo303Quarter:
+    return Modelo303Quarter(
+        quarter=quarter,
+        national_rep={},
+        intra_eu_acq={},
+        isp_other={},
+        intra_eu_deliveries=ZERO,
+        exports_goods=ZERO,
+        no_sujetas_loc=ZERO,
+        nat_current=BaseCuota(),
+        nat_assets=BaseCuota(),
+        imp_current=BaseCuota(),
+        imp_assets=BaseCuota(),
+        eu_current=BaseCuota(),
+        eu_assets=BaseCuota(),
+    )
+
+
+def _aggregate_income_303(quarter: Modelo303Quarter, invoices: list[InvoiceRecord]) -> None:
+    """Add income invoices to the quarter's repercutido buckets."""
+    for inv in invoices:
+        classification = classify_operation(inv.get("country_code"))
+        line_items: list[LineItem] = inv.get("line_items") or []
+
+        if not line_items:
+            # Fall back to invoice-level base when no line items are available.
+            base = inv.get("base") or ZERO
+            cuota = inv.get("vat_amount") or ZERO
+            rate = Decimal(inv.get("vat_pct") or 0)
+            if classification == OP_NATIONAL:
+                if cuota > 0 or rate > 0:
+                    quarter.national_rep.setdefault(rate, BaseCuota()).add(base, cuota)
+                else:
+                    # National exempt is rare; fold into no_sujetas as a catch-all.
+                    quarter.no_sujetas_loc += base
+            elif classification == OP_INTRA_EU:
+                quarter.intra_eu_deliveries += base
+            else:  # OP_EXPORT — services to non-EU → casilla 120 per user direction
+                quarter.no_sujetas_loc += base
+            continue
+
+        for li in line_items:
+            if li.kind == KIND_REIMBURSEMENT:
+                continue
+            if classification == OP_NATIONAL:
+                if li.vat_amount > 0 or li.vat_percent > 0:
+                    quarter.national_rep.setdefault(li.vat_percent, BaseCuota()).add(
+                        li.base, li.vat_amount
+                    )
+                else:
+                    quarter.no_sujetas_loc += li.base
+            elif classification == OP_INTRA_EU:
+                quarter.intra_eu_deliveries += li.base
+            else:  # OP_EXPORT
+                quarter.no_sujetas_loc += li.base
+
+
+def _aggregate_expense_303(
+    quarter: Modelo303Quarter,
+    invoices: list[InvoiceRecord],
+    self_assess_rate: Decimal,
+) -> None:
+    """Add expense invoices to the quarter's soportado buckets.
+
+    Intra-EU acquisitions with supplier VAT=0 are self-assessed at
+    self_assess_rate and mirrored into casillas 10-11 (devengado) and 36-39
+    (soportado, scaled by line's deductible_vat_percent).
+    """
+    for inv in invoices:
+        classification = classify_operation(inv.get("country_code"))
+        line_items: list[LineItem] = inv.get("line_items") or []
+
+        if not line_items:
+            # Fall back to invoice level without self-assessment.
+            base = inv.get("base") or ZERO
+            cuota = inv.get("vat_amount") or ZERO
+            target = {
+                OP_NATIONAL: quarter.nat_current,
+                OP_INTRA_EU: quarter.eu_current,
+                OP_EXPORT: quarter.imp_current,
+            }.get(classification, quarter.nat_current)
+            target.add(base, cuota)
+            continue
+
+        for li in line_items:
+            if li.kind == KIND_REIMBURSEMENT:
+                continue
+
+            is_asset = li.kind == KIND_ASSETS
+            deduct_fraction = li.deductible_vat_percent / HUNDRED
+            deducible_cuota = li.vat_amount * deduct_fraction
+
+            if classification == OP_NATIONAL:
+                target = quarter.nat_assets if is_asset else quarter.nat_current
+                target.add(li.base, deducible_cuota)
+
+            elif classification == OP_INTRA_EU:
+                if li.vat_percent == 0 and li.base != 0:
+                    # Self-assess: synthetic cuota at self_assess_rate.
+                    assessed_cuota = li.base * self_assess_rate / HUNDRED
+                    # Casillas 10-11: full self-assessed cuota as IVA devengado.
+                    quarter.intra_eu_acq.setdefault(self_assess_rate, BaseCuota()).add(
+                        li.base, assessed_cuota
+                    )
+                    # Casillas 36-37 / 38-39: mirrored as IVA soportado, scaled.
+                    target = quarter.eu_assets if is_asset else quarter.eu_current
+                    target.add(li.base, assessed_cuota * deduct_fraction)
+                else:
+                    # Supplier charged VAT (unusual for intra-EU B2B); use as-is.
+                    target = quarter.eu_assets if is_asset else quarter.eu_current
+                    target.add(li.base, deducible_cuota)
+
+            else:  # OP_EXPORT: non-EU supplier
+                # Heuristic: VAT=0 on a non-EU supplier invoice is almost
+                # always a reverse-charge service (SaaS, consulting, etc.),
+                # where Spain is the place of supply (art. 84.1.2º LIVA).
+                # VAT>0 from a non-EU supplier typically means customs VAT
+                # on a physical import. These behave very differently on
+                # the form.
+                if li.vat_percent == 0 and li.base != 0:
+                    assessed_cuota = li.base * self_assess_rate / HUNDRED
+                    # Casillas 12-13: devengado (full self-assessed cuota).
+                    quarter.isp_other.setdefault(self_assess_rate, BaseCuota()).add(
+                        li.base, assessed_cuota
+                    )
+                    # Casillas 28-31: deducible, reported together with
+                    # domestic purchases. Base is added gross, cuota scaled
+                    # by the line's deductible_vat_percent.
+                    target = quarter.nat_assets if is_asset else quarter.nat_current
+                    target.add(li.base, assessed_cuota * deduct_fraction)
+                else:
+                    # Physical import with customs VAT: casillas 32-35.
+                    target = quarter.imp_assets if is_asset else quarter.imp_current
+                    target.add(li.base, deducible_cuota)
+
+
+def compute_modelo_303(
+    income: list[InvoiceRecord],
+    expenses: list[InvoiceRecord],
+    self_assess_rate: Decimal = SELF_ASSESS_INTRA_EU_RATE,
+) -> list[Modelo303Quarter]:
+    """Compute Modelo 303 values for all four quarters of a year.
+
+    303 is per-quarter (not cumulative like 130): each quarter is a standalone
+    declaration. The "Anual" column in the sheet is the sum of the four quarters.
+    """
+    result: list[Modelo303Quarter] = []
+    for q in range(1, NUM_QUARTERS + 1):
+        quarter = _empty_modelo_303_quarter(q)
+        _aggregate_income_303(quarter, filter_by_quarter(income, q))
+        _aggregate_expense_303(quarter, filter_by_quarter(expenses, q), self_assess_rate)
+        result.append(quarter)
+    return result
 
 
 def _income_row(r: InvoiceRecord) -> list[Any]:
@@ -810,7 +1052,12 @@ def format_sheet(
 # ---------------------------------------------------------------------------
 
 
-def main(year: int | None = None, spreadsheet_id: str | None = None, credentials_path: str | None = None) -> None:
+def main(
+    year: int | None = None,
+    spreadsheet_id: str | None = None,
+    credentials_path: str | None = None,
+    self_assess_rate: Decimal = SELF_ASSESS_INTRA_EU_RATE,
+) -> None:
     if year is None:
         year = datetime.date.today().year
 
@@ -906,6 +1153,13 @@ def main(year: int | None = None, spreadsheet_id: str | None = None, credentials
 
     # Step 5: modelo summary sheets
     print("Writing modelo summary sheets...")
+    m303_quarters = compute_modelo_303(income, expenses, self_assess_rate=self_assess_rate)
+    write_modelo_sheet(
+        spreadsheet,
+        "Modelo 303",
+        _modelo_303_rows(m303_quarters, self_assess_rate=self_assess_rate),
+    )
+    time.sleep(1.0)
     m130_quarters = compute_modelo_130(income, expenses)
     write_modelo_sheet(spreadsheet, "Modelo 130", _modelo_130_rows(m130_quarters))
     time.sleep(1.0)
@@ -954,6 +1208,137 @@ class ModeloRow:
     values: list[Decimal] | None = None  # None for section headers / blank rows
     bold: bool = False
     section: bool = False
+
+
+def _modelo_303_rows(
+    quarters: list[Modelo303Quarter],
+    self_assess_rate: Decimal = SELF_ASSESS_INTRA_EU_RATE,
+) -> list[ModeloRow]:
+    """Build the displayable rows for the Modelo 303 sheet.
+
+    303 is per-quarter (not cumulative like 130). Anual = sum across T1..T4.
+    Rate buckets are discovered from the data, so the sheet only shows rows
+    for rates actually present.
+    """
+
+    # Collect all VAT rates that appear anywhere across quarters.
+    national_rates: set[Decimal] = set()
+    ai_rates: set[Decimal] = set()
+    isp_rates: set[Decimal] = set()
+    for q in quarters:
+        national_rates.update(q.national_rep.keys())
+        ai_rates.update(q.intra_eu_acq.keys())
+        isp_rates.update(q.isp_other.keys())
+
+    def rate_label(rate: Decimal) -> str:
+        # Strip trailing zeros for display: Decimal("21.0") → "21"
+        normalized = rate.normalize()
+        return f"{normalized:f}".rstrip(".")
+
+    sa_label = rate_label(self_assess_rate)
+
+    def across(getter: Callable[[Modelo303Quarter], Decimal]) -> list[Decimal]:
+        """[T1, T2, T3, T4, Anual] — Anual is the sum of the four quarters."""
+        vals = [getter(q) for q in quarters]
+        return vals + [sum(vals, start=ZERO)]
+
+    def rate_bucket_across(
+        bucket_getter: Callable[[Modelo303Quarter], dict[Decimal, BaseCuota]],
+        rate: Decimal,
+        field: str,
+    ) -> list[Decimal]:
+        def pick(q: Modelo303Quarter) -> Decimal:
+            bc = bucket_getter(q).get(rate)
+            return getattr(bc, field) if bc is not None else ZERO
+        return across(pick)
+
+    rows: list[ModeloRow] = [
+        ModeloRow(
+            f"Nota: Servicios a no-UE → cas. 120 (no cas. 60). Adq. "
+            f"intracomunitarias con IVA=0 se auto-liquidan al {sa_label} % en "
+            f"cas. 10-11 y 36-37. Servicios recibidos de no-UE con IVA=0 "
+            f"se auto-liquidan al {sa_label} % en cas. 12-13 (devengado) y "
+            f"28-29 (deducible). Reverse charge doméstico no se detecta.",
+            section=True,
+        ),
+        ModeloRow(""),
+        ModeloRow("IVA DEVENGADO (repercutido)", section=True),
+    ]
+
+    if national_rates:
+        for rate in sorted(national_rates):
+            label = rate_label(rate)
+            rows.append(ModeloRow(
+                f"Base régimen general {label} %",
+                rate_bucket_across(lambda q: q.national_rep, rate, "base"),
+            ))
+            rows.append(ModeloRow(
+                f"Cuota régimen general {label} %",
+                rate_bucket_across(lambda q: q.national_rep, rate, "cuota"),
+            ))
+    else:
+        rows.append(ModeloRow("Régimen general — sin operaciones nacionales"))
+
+    if ai_rates:
+        for rate in sorted(ai_rates):
+            label = rate_label(rate)
+            rows.append(ModeloRow(
+                f"10  Base adquisiciones intracomunitarias {label} %",
+                rate_bucket_across(lambda q: q.intra_eu_acq, rate, "base"),
+            ))
+            rows.append(ModeloRow(
+                f"11  Cuota adquisiciones intracomunitarias {label} %",
+                rate_bucket_across(lambda q: q.intra_eu_acq, rate, "cuota"),
+            ))
+
+    if isp_rates:
+        for rate in sorted(isp_rates):
+            label = rate_label(rate)
+            rows.append(ModeloRow(
+                f"12  Base otras op. con inv. sujeto pasivo {label} %",
+                rate_bucket_across(lambda q: q.isp_other, rate, "base"),
+            ))
+            rows.append(ModeloRow(
+                f"13  Cuota otras op. con inv. sujeto pasivo {label} %",
+                rate_bucket_across(lambda q: q.isp_other, rate, "cuota"),
+            ))
+
+    rows += [
+        ModeloRow("59  Entregas intracomunitarias exentas", across(lambda q: q.intra_eu_deliveries)),
+        ModeloRow("60  Exportaciones de bienes", across(lambda q: q.exports_goods)),
+        ModeloRow("120 No sujetas por localización (servicios no-UE)", across(lambda q: q.no_sujetas_loc)),
+        ModeloRow("TOTAL IVA devengado", across(lambda q: q.total_devengado), bold=True),
+        ModeloRow(""),
+
+        ModeloRow("IVA SOPORTADO (deducible)", section=True),
+        ModeloRow("28  Base op. interiores corrientes", across(lambda q: q.nat_current.base)),
+        ModeloRow("29  Cuota op. interiores corrientes", across(lambda q: q.nat_current.cuota)),
+        ModeloRow("30  Base op. interiores bienes de inversión", across(lambda q: q.nat_assets.base)),
+        ModeloRow("31  Cuota op. interiores bienes de inversión", across(lambda q: q.nat_assets.cuota)),
+        ModeloRow("32  Base importaciones corrientes", across(lambda q: q.imp_current.base)),
+        ModeloRow("33  Cuota importaciones corrientes", across(lambda q: q.imp_current.cuota)),
+        ModeloRow("34  Base importaciones bienes de inversión", across(lambda q: q.imp_assets.base)),
+        ModeloRow("35  Cuota importaciones bienes de inversión", across(lambda q: q.imp_assets.cuota)),
+        ModeloRow("36  Base adq. intracomunitarias corrientes", across(lambda q: q.eu_current.base)),
+        ModeloRow("37  Cuota adq. intracomunitarias corrientes", across(lambda q: q.eu_current.cuota)),
+        ModeloRow("38  Base adq. intracomunitarias bienes de inversión", across(lambda q: q.eu_assets.base)),
+        ModeloRow("39  Cuota adq. intracomunitarias bienes de inversión", across(lambda q: q.eu_assets.cuota)),
+        ModeloRow("TOTAL IVA deducible", across(lambda q: q.total_deducible), bold=True),
+        ModeloRow(""),
+
+        ModeloRow("RESULTADO", section=True),
+        ModeloRow("Resultado régimen general (devengado − deducible)",
+                  across(lambda q: q.resultado), bold=True),
+        ModeloRow(""),
+
+        ModeloRow("No aplicados en este resumen", section=True),
+        ModeloRow(
+            "44 / 55 (prorata), 62-65 (regularización bienes inv.), "
+            "67-68 (compensaciones anteriores), 77 (retenciones), "
+            "108-111 (modificación bases), 122-125 (otras no sujetas)"
+        ),
+    ]
+    return rows
 
 
 def _modelo_130_rows(quarters: list[Modelo130Quarter]) -> list[ModeloRow]:
@@ -1088,8 +1473,22 @@ def cli() -> None:
     parser.add_argument("--year", type=int, default=None, help="Fiscal year (default: current year)")
     parser.add_argument("--spreadsheet-id", type=str, default=None, help="Google Sheets spreadsheet ID")
     parser.add_argument("--credentials", type=str, default=None, help="Path to service account JSON key")
+    parser.add_argument(
+        "--self-assess-rate",
+        type=Decimal,
+        default=SELF_ASSESS_INTRA_EU_RATE,
+        help=(
+            "VAT rate used to self-assess reverse-charge transactions (intra-EU "
+            f"acquisitions and non-EU services). Default: {SELF_ASSESS_INTRA_EU_RATE} %."
+        ),
+    )
     args = parser.parse_args()
-    main(year=args.year, spreadsheet_id=args.spreadsheet_id, credentials_path=args.credentials)
+    main(
+        year=args.year,
+        spreadsheet_id=args.spreadsheet_id,
+        credentials_path=args.credentials,
+        self_assess_rate=args.self_assess_rate,
+    )
 
 
 if __name__ == "__main__":
