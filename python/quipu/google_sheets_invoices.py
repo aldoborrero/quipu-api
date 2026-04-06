@@ -10,18 +10,16 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import time
+from dataclasses import dataclass
 from typing import Any
 
 import gspread
 from gspread_formatting import (
-    Border,
-    Borders,
     CellFormat,
     Color,
     NumberFormat,
-    TextFormat,
-    format_cell_range,
-    set_frozen,
+    format_cell_ranges,
 )
 
 from quipu import create_client
@@ -35,84 +33,89 @@ from quipu_client.types import Unset
 # Constants
 # ---------------------------------------------------------------------------
 
-# User-facing column headers (Spanish, as required by the output spreadsheet)
-INCOME_HEADERS: list[str] = [
-    "Fecha de emisión",
-    "Vencimiento",
-    "Fecha de pago",
-    "Número",
-    "Número de Factura",
-    "Tipo de operación",
-    "Cliente",
-    "Cuenta de cliente",
-    "NIF",
-    "Código postal",
-    "Concepto",
-    "Estado",
-    "Rectificativa?",
-    "Base",
-    "IVA",
-    "IVA (%)",
-    "Recargo de equivalencia",
-]
-
-EXPENSES_HEADERS: list[str] = [
-    "Fecha de emisión",
-    "Número de Factura",
-    "Proveedor",
-    "Cuenta de Proveedor",
-    "NIF",
-    "Base",
-    "IVA",
-    "IVA (%)",
-    "Total",
-]
-
-NUM_INCOME_COLS: int = len(INCOME_HEADERS)
-NUM_EXPENSES_COLS: int = len(EXPENSES_HEADERS)
-
 SHEET_TYPE_INCOME: str = "income"
 SHEET_TYPE_EXPENSES: str = "expenses"
 
-# Quarter colors for row highlighting (income master sheet)
-COLOR_WHITE: Color = Color(1, 1, 1)
-COLOR_Q2_YELLOW: Color = Color(1, 0.976, 0.769)  # #fff9c4
-COLOR_Q3_GREEN: Color = Color(0.910, 0.961, 0.914)  # #e8f5e9
-COLOR_Q4_BLUE: Color = Color(0.890, 0.949, 0.992)  # #e3f2fd
-
+# Quarter colors for row highlighting on the income master sheet (Q1 stays the
+# default white and is skipped at write time, so it's omitted here).
 QUARTER_COLORS: dict[int, Color] = {
-    1: COLOR_WHITE,
-    2: COLOR_Q2_YELLOW,
-    3: COLOR_Q3_GREEN,
-    4: COLOR_Q4_BLUE,
+    2: Color(1, 0.976, 0.769),      # Q2: #fff9c4 yellow
+    3: Color(0.910, 0.961, 0.914),  # Q3: #e8f5e9 green
+    4: Color(0.890, 0.949, 0.992),  # Q4: #e3f2fd blue
 }
-
-HEADER_BG_COLOR: Color = Color(0.827, 0.827, 0.827)  # #d3d3d3
-HEADER_TEXT_COLOR: Color = Color(0, 0, 0)
-BORDER_COLOR: Color = Color(0.8, 0.8, 0.8)
-
-# Column letters for the Income sheet
-INCOME_DATE_COLS: list[str] = ["A", "B", "C"]
-INCOME_COL_BASE: str = "N"
-INCOME_COL_VAT: str = "O"
-INCOME_COL_VAT_PCT: str = "P"
-INCOME_COL_SURCHARGE: str = "Q"
-INCOME_COL_CONCEPT_IDX: int = 10  # 0-based index for column K
-
-# Column letters for the Expenses sheet
-EXPENSES_DATE_COLS: list[str] = ["A"]
-EXPENSES_COL_BASE: str = "F"
-EXPENSES_COL_VAT: str = "G"
-EXPENSES_COL_VAT_PCT: str = "H"
-EXPENSES_COL_TOTAL: str = "I"
 
 CONCEPT_WIDTH_PX: int = 300
 SPREADSHEET_LOCALE: str = "es_ES"
 
-# Formatting patterns
+# Formatting patterns (cell-level, in addition to native table column types)
 DATE_PATTERN: str = "dd/MM/yyyy"
-CURRENCY_PATTERN: str = '#,##0.00 "€"'
-INTEGER_PATTERN: str = "0"
+PERCENT_PATTERN: str = "0%"
+
+DATE_FMT = CellFormat(
+    numberFormat=NumberFormat(type="DATE", pattern=DATE_PATTERN),
+    horizontalAlignment="LEFT",
+)
+PERCENT_FMT = CellFormat(
+    numberFormat=NumberFormat(type="PERCENT", pattern=PERCENT_PATTERN),
+    horizontalAlignment="RIGHT",
+)
+WRAP_FMT = CellFormat(wrapStrategy="WRAP")
+
+
+@dataclass(frozen=True)
+class SheetSpec:
+    """Per-sheet-type configuration: column layout, types, and formatting."""
+
+    headers: list[str]
+    column_types: list[str]
+    date_cols: list[str]
+    percent_col: str
+    wrap_col: str | None = None              # column letter for wrap (income's Concept)
+    fixed_width_col_idx: int | None = None   # 0-based column index for fixed-width override
+
+    @property
+    def num_cols(self) -> int:
+        return len(self.headers)
+
+
+SHEET_SPECS: dict[str, SheetSpec] = {
+    SHEET_TYPE_INCOME: SheetSpec(
+        headers=[
+            "Fecha de emisión", "Vencimiento", "Fecha de pago", "Número",
+            "Número de Factura", "Tipo de operación", "Cliente", "Cuenta de cliente",
+            "NIF", "Código postal", "Concepto", "Estado", "Rectificativa?",
+            "Base", "IVA", "IVA (%)", "Recargo de equivalencia",
+        ],
+        column_types=[
+            "DATE", "DATE", "DATE",                                              # A-C
+            "TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "TEXT", "TEXT",  # D-L
+            "BOOLEAN",                                                           # M: Rectificativa?
+            "CURRENCY", "CURRENCY",                                              # N-O: Base, IVA
+            "PERCENT",                                                           # P: IVA (%)
+            "CURRENCY",                                                          # Q: Recargo
+        ],
+        date_cols=["A", "B", "C"],
+        percent_col="P",                  # IVA %
+        wrap_col="K",                     # Concepto
+        fixed_width_col_idx=10,           # K, 0-based
+    ),
+    SHEET_TYPE_EXPENSES: SheetSpec(
+        headers=[
+            "Fecha de emisión", "Número de Factura", "Proveedor",
+            "Cuenta de Proveedor", "NIF", "Base", "IVA", "IVA (%)", "Total",
+        ],
+        column_types=[
+            "DATE",                                            # A
+            "TEXT", "TEXT", "TEXT", "TEXT",                    # B-E
+            "CURRENCY", "CURRENCY",                            # F-G: Base, IVA
+            "PERCENT",                                         # H: IVA (%)
+            "CURRENCY",                                        # I: Total
+        ],
+        date_cols=["A"],
+        percent_col="H",                  # IVA %
+    ),
+}
+
 
 # Payment status API values to Spanish display labels
 PAYMENT_STATUS_LABELS: dict[str, str] = {
@@ -128,9 +131,6 @@ SHEETS_EPOCH: datetime.date = datetime.date(1899, 12, 30)  # Google Sheets seria
 
 # Type alias for invoice record dicts
 InvoiceRecord = dict[str, Any]
-
-# Sheet config: (worksheet, sheet_type, num_data_rows, quarter_data_or_none)
-SheetConfig = tuple[gspread.Worksheet, str, int, list[int] | None]
 
 
 # ---------------------------------------------------------------------------
@@ -186,11 +186,12 @@ def _col_letter(n: int) -> str:
     return result
 
 
-def _money_or_dash(val: float | None) -> float | str:
-    """Return the numeric value for currency cells, or '-' if zero/None."""
-    if val is None or val == 0:
-        return "-"
-    return val
+def _money(val: float | None) -> float:
+    """Return the numeric value for currency cells, or 0 for None.
+
+    Zero values are displayed as '-' via the cell number format pattern.
+    """
+    return val if val is not None else 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -436,11 +437,11 @@ def _income_row(r: InvoiceRecord) -> list[Any]:
         r["contact_zip"],
         r["concept"],
         r["payment_status"],
-        "Sí" if r["is_amending"] else "-",
-        r["base"] if r["base"] is not None else 0,
-        _money_or_dash(r["vat_amount"]),
-        r["vat_pct"],
-        _money_or_dash(r["surcharge"]),
+        bool(r["is_amending"]),
+        _money(r["base"]),
+        _money(r["vat_amount"]),
+        (r["vat_pct"] or 0) / 100,
+        _money(r["surcharge"]),
     ]
 
 
@@ -452,10 +453,10 @@ def _expense_row(r: InvoiceRecord) -> list[Any]:
         r["contact_name"],
         r["contact_account"],
         r["contact_tax_id"],
-        r["base"] if r["base"] is not None else 0,
-        _money_or_dash(r["vat_amount"]),
-        r["vat_pct"],
-        r["total"] if r["total"] is not None else 0,
+        _money(r["base"]),
+        _money(r["vat_amount"]),
+        (r["vat_pct"] or 0) / 100,
+        _money(r["total"]),
     ]
 
 
@@ -466,48 +467,20 @@ def _expense_row(r: InvoiceRecord) -> list[Any]:
 
 def _ensure_worksheet(spreadsheet: gspread.Spreadsheet, title: str, rows: int, cols: int) -> gspread.Worksheet:
     """Get or create a worksheet, resizing it to the required dimensions."""
+    # Need at least 2 rows so set_frozen(rows=1) doesn't fail with "can't freeze all visible rows".
+    actual_rows = max(rows, 2)
     try:
         ws = spreadsheet.worksheet(title)
         ws.clear()
-        ws.resize(rows=max(rows, 1), cols=cols)
+        ws.resize(rows=actual_rows, cols=cols)
     except gspread.WorksheetNotFound:
-        ws = spreadsheet.add_worksheet(title=title, rows=max(rows, 1), cols=cols)
+        ws = spreadsheet.add_worksheet(title=title, rows=actual_rows, cols=cols)
     return ws
 
 
-def write_sheet(worksheet: gspread.Worksheet, rows: list[list[Any]], headers: list[str]) -> None:
-    """Write headers + data rows to the worksheet."""
-    all_data: list[list[Any]] = [headers] + rows
-    worksheet.update(all_data, value_input_option="RAW")
-
-
-def _apply_date_format(worksheet: gspread.Worksheet, cols: list[str], total_rows: int) -> None:
-    """Apply date formatting to the specified columns."""
-    date_fmt = CellFormat(
-        numberFormat=NumberFormat(type="DATE", pattern=DATE_PATTERN),
-        horizontalAlignment="LEFT",
-    )
-    for col in cols:
-        format_cell_range(worksheet, f"{col}{FIRST_DATA_ROW}:{col}{total_rows}", date_fmt)
-
-
-def _apply_currency_format(worksheet: gspread.Worksheet, cols: list[str], total_rows: int) -> None:
-    """Apply currency formatting to the specified columns."""
-    currency_fmt = CellFormat(
-        numberFormat=NumberFormat(type="NUMBER", pattern=CURRENCY_PATTERN),
-        horizontalAlignment="RIGHT",
-    )
-    for col in cols:
-        format_cell_range(worksheet, f"{col}{FIRST_DATA_ROW}:{col}{total_rows}", currency_fmt)
-
-
-def _apply_integer_format(worksheet: gspread.Worksheet, col: str, total_rows: int) -> None:
-    """Apply integer formatting to a column."""
-    pct_fmt = CellFormat(
-        numberFormat=NumberFormat(type="NUMBER", pattern=INTEGER_PATTERN),
-        horizontalAlignment="RIGHT",
-    )
-    format_cell_range(worksheet, f"{col}{FIRST_DATA_ROW}:{col}{total_rows}", pct_fmt)
+def _col_pairs(cols: list[str], fmt: CellFormat, total_rows: int) -> list[tuple[str, CellFormat]]:
+    """Build (range, fmt) pairs for each column from FIRST_DATA_ROW to total_rows."""
+    return [(f"{col}{FIRST_DATA_ROW}:{col}{total_rows}", fmt) for col in cols]
 
 
 def format_sheet(
@@ -524,69 +497,59 @@ def format_sheet(
         num_rows: number of data rows (excluding header)
         quarter_data: list of quarter numbers (1-4) per data row, for row coloring on income sheets
     """
-    num_cols = NUM_INCOME_COLS if sheet_type == SHEET_TYPE_INCOME else NUM_EXPENSES_COLS
-    last_col = _col_letter(num_cols)
-
-    set_frozen(worksheet, rows=1)
-
-    # Header formatting (always applied, even for empty sheets)
-    header_fmt = CellFormat(
-        backgroundColor=HEADER_BG_COLOR,
-        textFormat=TextFormat(bold=True, foregroundColor=HEADER_TEXT_COLOR),
-        horizontalAlignment="CENTER",
-    )
-    format_cell_range(worksheet, f"A1:{last_col}1", header_fmt)
-
-    if num_rows == 0:
-        return
-
+    spec = SHEET_SPECS[sheet_type]
+    sheet_id = worksheet.id
     total_rows = num_rows + 1  # +1 for header
 
-    # Borders for all cells with data
-    thin_border = Border("SOLID", BORDER_COLOR)
-    border_fmt = CellFormat(
-        borders=Borders(top=thin_border, bottom=thin_border, left=thin_border, right=thin_border)
-    )
-    format_cell_range(worksheet, f"A1:{last_col}{total_rows}", border_fmt)
+    # Number/date format patterns (table column types don't define a display pattern).
+    fmt_pairs: list[tuple[str, CellFormat]] = []
+    if num_rows > 0:
+        fmt_pairs.extend(_col_pairs(spec.date_cols, DATE_FMT, total_rows))
+        fmt_pairs.extend(_col_pairs([spec.percent_col], PERCENT_FMT, total_rows))
+        if spec.wrap_col:
+            fmt_pairs.extend(_col_pairs([spec.wrap_col], WRAP_FMT, total_rows))
+    if fmt_pairs:
+        format_cell_ranges(worksheet, fmt_pairs)
 
-    # Date columns
-    if sheet_type == SHEET_TYPE_INCOME:
-        _apply_date_format(worksheet, INCOME_DATE_COLS, total_rows)
-    else:
-        _apply_date_format(worksheet, EXPENSES_DATE_COLS, total_rows)
+    # Single batch_update for: addTable, row colors, auto-resize, fixed-width override.
+    # (Pre-existing tables are deleted in main() *before* data is written, since
+    # deleteTable also wipes the underlying cell data.)
+    batch_requests: list[dict[str, Any]] = []
 
-    # Currency & percentage columns
-    if sheet_type == SHEET_TYPE_INCOME:
-        _apply_currency_format(worksheet, [INCOME_COL_BASE, INCOME_COL_VAT, INCOME_COL_SURCHARGE], total_rows)
-        _apply_integer_format(worksheet, INCOME_COL_VAT_PCT, total_rows)
-    else:
-        _apply_currency_format(worksheet, [EXPENSES_COL_BASE, EXPENSES_COL_VAT, EXPENSES_COL_TOTAL], total_rows)
-        _apply_integer_format(worksheet, EXPENSES_COL_VAT_PCT, total_rows)
+    table_end_row = max(total_rows, 2)  # tables need at least 1 data row
+    batch_requests.append({
+        "addTable": {
+            "table": {
+                "name": worksheet.title,
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": table_end_row,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": spec.num_cols,
+                },
+                "columnProperties": [
+                    {"columnIndex": i, "columnName": spec.headers[i], "columnType": spec.column_types[i]}
+                    for i in range(spec.num_cols)
+                ],
+            }
+        }
+    })
 
-    # Concept column (K) in income sheets: wide + wrap
-    if sheet_type == SHEET_TYPE_INCOME:
-        wrap_fmt = CellFormat(wrapStrategy="WRAP")
-        format_cell_range(worksheet, f"K{FIRST_DATA_ROW}:K{total_rows}", wrap_fmt)
-
-    # Row coloring by quarter (income master sheet only)
-    # Batch all row color requests into a single API call to avoid per-row overhead.
-    if sheet_type == SHEET_TYPE_INCOME and quarter_data:
-        color_requests: list[dict[str, Any]] = []
+    if num_rows > 0 and quarter_data:
         for i, q in enumerate(quarter_data):
-            if q == 1:  # Q1 is white (default), skip
-                continue
             color = QUARTER_COLORS.get(q)
             if not color:
                 continue
-            row_idx = i + 1  # 0-based row index; header is row 0, first data row is 1
-            color_requests.append({
+            row_idx = i + 1  # 0-based; header is row 0, first data row is 1
+            batch_requests.append({
                 "repeatCell": {
                     "range": {
-                        "sheetId": worksheet.id,
+                        "sheetId": sheet_id,
                         "startRowIndex": row_idx,
                         "endRowIndex": row_idx + 1,
                         "startColumnIndex": 0,
-                        "endColumnIndex": num_cols,
+                        "endColumnIndex": spec.num_cols,
                     },
                     "cell": {
                         "userEnteredFormat": {
@@ -600,38 +563,34 @@ def format_sheet(
                     "fields": "userEnteredFormat.backgroundColor",
                 }
             })
-        if color_requests:
-            worksheet.spreadsheet.batch_update({"requests": color_requests})
 
-    # Column widths: auto-resize all columns first
-    sheet_id = worksheet.id
-    auto_requests: list[dict[str, Any]] = [{
-        "autoResizeDimensions": {
-            "dimensions": {
-                "sheetId": sheet_id,
-                "dimension": "COLUMNS",
-                "startIndex": 0,
-                "endIndex": num_cols,
+    if num_rows > 0:
+        batch_requests.append({
+            "autoResizeDimensions": {
+                "dimensions": {
+                    "sheetId": sheet_id,
+                    "dimension": "COLUMNS",
+                    "startIndex": 0,
+                    "endIndex": spec.num_cols,
+                }
             }
-        }
-    }]
-    worksheet.spreadsheet.batch_update({"requests": auto_requests})
+        })
 
-    # Then override Concept (K) with fixed width so auto-resize doesn't undo it
-    if sheet_type == SHEET_TYPE_INCOME:
-        fix_requests: list[dict[str, Any]] = [{
+    if spec.fixed_width_col_idx is not None:
+        batch_requests.append({
             "updateDimensionProperties": {
                 "range": {
                     "sheetId": sheet_id,
                     "dimension": "COLUMNS",
-                    "startIndex": INCOME_COL_CONCEPT_IDX,
-                    "endIndex": INCOME_COL_CONCEPT_IDX + 1,
+                    "startIndex": spec.fixed_width_col_idx,
+                    "endIndex": spec.fixed_width_col_idx + 1,
                 },
                 "properties": {"pixelSize": CONCEPT_WIDTH_PX},
                 "fields": "pixelSize",
             }
-        }]
-        worksheet.spreadsheet.batch_update({"requests": fix_requests})
+        })
+
+    worksheet.spreadsheet.batch_update({"requests": batch_requests})
 
 
 # ---------------------------------------------------------------------------
@@ -684,44 +643,68 @@ def main(year: int | None = None, spreadsheet_id: str | None = None, credentials
     expense_rows = [_expense_row(r) for r in expenses]
     income_quarters = [r["quarter"] for r in income]
 
-    # Master sheets
-    sheet_configs: list[SheetConfig] = []
-
-    ws = _ensure_worksheet(spreadsheet, "Ingresos", len(income_rows) + 1, NUM_INCOME_COLS)
-    write_sheet(ws, income_rows, INCOME_HEADERS)
-    sheet_configs.append((ws, SHEET_TYPE_INCOME, len(income_rows), income_quarters))
-
-    ws = _ensure_worksheet(spreadsheet, "Gastos", len(expense_rows) + 1, NUM_EXPENSES_COLS)
-    write_sheet(ws, expense_rows, EXPENSES_HEADERS)
-    sheet_configs.append((ws, SHEET_TYPE_EXPENSES, len(expense_rows), None))
-
-    # Quarterly sheets
+    # Define all sheets to write: (title, sheet_type, rows, quarters_or_none)
+    sheets_to_write: list[tuple[str, str, list[list[Any]], list[int] | None]] = [
+        ("Ingresos", SHEET_TYPE_INCOME, income_rows, income_quarters),
+        ("Gastos", SHEET_TYPE_EXPENSES, expense_rows, None),
+    ]
     for q in range(1, NUM_QUARTERS + 1):
-        q_income = filter_by_quarter(income, q)
-        q_rows = [_income_row(r) for r in q_income]
-        ws = _ensure_worksheet(spreadsheet, f"Ingresos T{q}", len(q_rows) + 1, NUM_INCOME_COLS)
-        write_sheet(ws, q_rows, INCOME_HEADERS)
-        sheet_configs.append((ws, SHEET_TYPE_INCOME, len(q_rows), None))
+        sheets_to_write.append((
+            f"Ingresos T{q}", SHEET_TYPE_INCOME,
+            [_income_row(r) for r in filter_by_quarter(income, q)], None,
+        ))
+        sheets_to_write.append((
+            f"Gastos T{q}", SHEET_TYPE_EXPENSES,
+            [_expense_row(r) for r in filter_by_quarter(expenses, q)], None,
+        ))
 
-        q_expenses = filter_by_quarter(expenses, q)
-        q_rows = [_expense_row(r) for r in q_expenses]
-        ws = _ensure_worksheet(spreadsheet, f"Gastos T{q}", len(q_rows) + 1, NUM_EXPENSES_COLS)
-        write_sheet(ws, q_rows, EXPENSES_HEADERS)
-        sheet_configs.append((ws, SHEET_TYPE_EXPENSES, len(q_rows), None))
+    # Step 1: ensure all worksheets exist with the correct dimensions (this clears them).
+    sheet_configs: list[tuple[gspread.Worksheet, str, list[list[Any]], list[int] | None]] = []
+    for title, sheet_type, rows, quarters in sheets_to_write:
+        spec = SHEET_SPECS[sheet_type]
+        ws = _ensure_worksheet(spreadsheet, title, len(rows) + 1, spec.num_cols)
+        sheet_configs.append((ws, sheet_type, rows, quarters))
 
     # Remove default "Sheet1" if it exists
     try:
-        default_sheet = spreadsheet.worksheet("Sheet1")
-        spreadsheet.del_worksheet(default_sheet)
+        spreadsheet.del_worksheet(spreadsheet.worksheet("Sheet1"))
     except gspread.WorksheetNotFound:
         pass
 
-    # Apply formatting to all sheets
+    # Step 2: delete any pre-existing tables in a single batch BEFORE writing data.
+    # deleteTable wipes the underlying cells, so it must run on empty worksheets.
+    tables_by_sheet_id = _fetch_tables_by_sheet(spreadsheet)
+    delete_requests: list[dict[str, Any]] = []
+    for tids in tables_by_sheet_id.values():
+        for tid in tids:
+            delete_requests.append({"deleteTable": {"tableId": tid}})
+    if delete_requests:
+        spreadsheet.batch_update({"requests": delete_requests})
+
+    # Step 3: write data into the (now table-free, empty) worksheets.
+    for ws, sheet_type, rows, _ in sheet_configs:
+        spec = SHEET_SPECS[sheet_type]
+        ws.update([spec.headers] + rows, value_input_option="RAW")
+
+    # Step 4: apply formatting and recreate native tables.
     print("Applying formatting...")
-    for ws, sheet_type, num_rows, quarters in sheet_configs:
-        format_sheet(ws, sheet_type, num_rows, quarters)
+    for ws, sheet_type, rows, quarters in sheet_configs:
+        format_sheet(ws, sheet_type, len(rows), quarters)
+        time.sleep(1.0)  # stay under Sheets API write quota (60/min/user)
 
     print("Done!")
+
+
+def _fetch_tables_by_sheet(spreadsheet: gspread.Spreadsheet) -> dict[int, list[int | str]]:
+    """Return {sheet_id: [tableId, ...]} for all tables in the spreadsheet."""
+    meta = spreadsheet.fetch_sheet_metadata({"fields": "sheets(properties(sheetId),tables(tableId))"})
+    out: dict[int, list[int | str]] = {}
+    for sheet in meta.get("sheets", []):
+        sid = sheet["properties"]["sheetId"]
+        tids = [t["tableId"] for t in sheet.get("tables", [])]
+        if tids:
+            out[sid] = tids
+    return out
 
 
 def cli() -> None:
