@@ -129,6 +129,19 @@ NUM_QUARTERS: int = 4
 FIRST_DATA_ROW: int = 2  # 1-indexed row where data starts (after header)
 SHEETS_EPOCH: datetime.date = datetime.date(1899, 12, 30)  # Google Sheets serial date epoch
 
+# ISO 3166-1 alpha-2 codes for EU member states (as of 2026). ES is the home
+# country and is classified as "national" rather than "intra_eu".
+EU_COUNTRY_CODES: frozenset[str] = frozenset({
+    "AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR",
+    "DE", "GR", "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL",
+    "PL", "PT", "RO", "SK", "SI", "SE",
+})
+
+# Operation classification used by Modelos 303, 349 and 390.
+OP_NATIONAL: str = "national"       # ES (or unknown — treated as domestic by default)
+OP_INTRA_EU: str = "intra_eu"       # EU member state other than ES
+OP_EXPORT: str = "export"           # non-EU country
+
 # Type alias for invoice record dicts
 InvoiceRecord = dict[str, Any]
 
@@ -195,6 +208,24 @@ def _payment_status_label(status: Any) -> str:
 def _get_quarter(d: datetime.date) -> int:
     """Return the quarter (1-4) for a given date."""
     return (d.month - 1) // 3 + 1
+
+
+def classify_operation(country_code: str | None) -> str:
+    """Classify an invoice by counterparty country for tax form aggregation.
+
+    Returns one of OP_NATIONAL, OP_INTRA_EU, OP_EXPORT. Missing or empty
+    country codes are treated as national — the defensible default for Modelo
+    303, where an unclassified operation should not be reported as intra-EU
+    or export without explicit evidence.
+    """
+    if not country_code:
+        return OP_NATIONAL
+    code = country_code.upper()
+    if code == "ES":
+        return OP_NATIONAL
+    if code in EU_COUNTRY_CODES:
+        return OP_INTRA_EU
+    return OP_EXPORT
 
 
 def _col_letter(n: int) -> str:
