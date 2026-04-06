@@ -12,7 +12,21 @@ import argparse
 import datetime
 import time
 from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
+
+# Monetary constants. Use Decimal for all internal arithmetic to avoid the
+# accumulation and rounding errors of IEEE 754 floats — these values end up on
+# real tax forms and a cent of drift is not acceptable.
+ZERO: Decimal = Decimal("0")
+HUNDRED: Decimal = Decimal("100")
+CENT: Decimal = Decimal("0.01")
+
+
+def _money_round(value: Decimal) -> Decimal:
+    """Round a Decimal to 2 decimal places, half-up (banker's rounding is not
+    what Spanish tax forms use)."""
+    return value.quantize(CENT, rounding=ROUND_HALF_UP)
 
 import gspread
 from gspread_formatting import (
@@ -152,18 +166,19 @@ class LineItem:
 
     Base is the line's pre-tax amount (unitary * qty - discount). VAT and
     retention amounts are the actual EUR values on that line. Deductible
-    percentages default to 100% when Quipu doesn't set them.
+    percentages default to 100 when Quipu doesn't set them. All monetary
+    fields use Decimal for exact arithmetic.
     """
 
     description: str
-    base: float
-    vat_percent: float
-    vat_amount: float
-    retention_amount: float
-    deductible_vat_percent: float     # 0-100
-    deductible_expense_percent: float  # 0-100
-    kind: str                          # "current" | "assets" | "reimbursement"
-    surcharge_amount: float            # equivalence surcharge (from additional_properties)
+    base: Decimal
+    vat_percent: Decimal
+    vat_amount: Decimal
+    retention_amount: Decimal
+    deductible_vat_percent: Decimal     # 0-100
+    deductible_expense_percent: Decimal  # 0-100
+    kind: str                            # "current" | "assets" | "reimbursement"
+    surcharge_amount: Decimal            # equivalence surcharge (from additional_properties)
 
 
 # ---------------------------------------------------------------------------
@@ -178,13 +193,17 @@ def _val(attr: Any) -> Any:
     return attr
 
 
-def _to_float(s: Any) -> float | None:
-    """Convert a value to float, returning None for Unset/None/invalid."""
-    if isinstance(s, Unset) or s is None:
+def _to_decimal(s: Any) -> Decimal | None:
+    """Convert a value to Decimal, returning None for Unset/None/invalid.
+
+    Strings are passed directly to Decimal to avoid a lossy float intermediary
+    (Quipu returns amounts as strings like "172.5"). Ints are accepted as-is.
+    """
+    if isinstance(s, Unset) or s is None or s == "":
         return None
     try:
-        return float(s)
-    except (ValueError, TypeError):
+        return Decimal(str(s))
+    except (InvalidOperation, ValueError, TypeError):
         return None
 
 
@@ -237,12 +256,18 @@ def _col_letter(n: int) -> str:
     return result
 
 
-def _money(val: float | None) -> float:
-    """Return the numeric value for currency cells, or 0 for None.
+def _money(val: Decimal | float | None) -> float:
+    """Convert a monetary value to float for writing into a Sheets cell.
 
+    Sheets stores numbers as IEEE 754 anyway, so we round to cents first to
+    keep the displayed value exact and only bridge to float at the boundary.
     Zero values are displayed as '-' via the cell number format pattern.
     """
-    return val if val is not None else 0.0
+    if val is None:
+        return 0.0
+    if isinstance(val, Decimal):
+        return float(_money_round(val))
+    return float(val)
 
 
 # ---------------------------------------------------------------------------
@@ -276,30 +301,30 @@ def _extract_line_item(items_map: dict[str, Any], item_ref: Any) -> LineItem | N
 
     description = str(_attr(item_attrs, additional, "concept", "description") or "")
 
-    # Base: prefer explicit line base; else unitary * quantity (minus discount).
-    unitary = _to_float(_attr(item_attrs, additional, "unitary_amount")) or 0.0
-    quantity = _to_float(_attr(item_attrs, additional, "quantity")) or 0.0
-    discount_amount = _to_float(_attr(item_attrs, additional, "discount_amount")) or 0.0
-    discount_pct = _to_float(_attr(item_attrs, additional, "discount_percent")) or 0.0
+    # Base: unitary * quantity minus discount (either absolute or percent).
+    unitary = _to_decimal(_attr(item_attrs, additional, "unitary_amount")) or ZERO
+    quantity = _to_decimal(_attr(item_attrs, additional, "quantity")) or ZERO
+    discount_amount = _to_decimal(_attr(item_attrs, additional, "discount_amount")) or ZERO
+    discount_pct = _to_decimal(_attr(item_attrs, additional, "discount_percent")) or ZERO
     gross_base = unitary * quantity
     if discount_amount:
         base = gross_base - discount_amount
     else:
-        base = gross_base * (1 - discount_pct / 100)
+        base = gross_base * (1 - discount_pct / HUNDRED)
 
-    vat_percent = _to_float(_attr(item_attrs, additional, "vat_percent")) or 0.0
-    vat_amount = _to_float(_attr(item_attrs, additional, "vat_amount")) or 0.0
-    retention_amount = _to_float(_attr(item_attrs, additional, "retention_amount")) or 0.0
+    vat_percent = _to_decimal(_attr(item_attrs, additional, "vat_percent")) or ZERO
+    vat_amount = _to_decimal(_attr(item_attrs, additional, "vat_amount")) or ZERO
+    retention_amount = _to_decimal(_attr(item_attrs, additional, "retention_amount")) or ZERO
 
     # Deductibility defaults to 100% when unset (most line items are fully deductible).
-    deductible_vat_pct = _to_float(_attr(item_attrs, additional, "deductible_vat_percent"))
-    deductible_expense_pct = _to_float(_attr(item_attrs, additional, "deductible_expense_percent"))
+    deductible_vat_pct = _to_decimal(_attr(item_attrs, additional, "deductible_vat_percent"))
+    deductible_expense_pct = _to_decimal(_attr(item_attrs, additional, "deductible_expense_percent"))
 
     kind_raw = _attr(item_attrs, additional, "kind")
     kind = str(kind_raw.value if hasattr(kind_raw, "value") else kind_raw or "current")
 
     surcharge_raw = additional.get("equivalence_surcharge_amount") or additional.get("surcharge_amount")
-    surcharge_amount = _to_float(surcharge_raw) or 0.0
+    surcharge_amount = _to_decimal(surcharge_raw) or ZERO
 
     return LineItem(
         description=description,
@@ -307,17 +332,17 @@ def _extract_line_item(items_map: dict[str, Any], item_ref: Any) -> LineItem | N
         vat_percent=vat_percent,
         vat_amount=vat_amount,
         retention_amount=retention_amount,
-        deductible_vat_percent=deductible_vat_pct if deductible_vat_pct is not None else 100.0,
-        deductible_expense_percent=deductible_expense_pct if deductible_expense_pct is not None else 100.0,
+        deductible_vat_percent=deductible_vat_pct if deductible_vat_pct is not None else HUNDRED,
+        deductible_expense_percent=deductible_expense_pct if deductible_expense_pct is not None else HUNDRED,
         kind=kind,
         surcharge_amount=surcharge_amount,
     )
 
 
 def _infer_vat_percent(
-    item_vat_percents: list[float],
-    vat_amount: float | None,
-    base: float | None,
+    item_vat_percents: list[Decimal],
+    vat_amount: Decimal | None,
+    base: Decimal | None,
 ) -> int:
     """Determine the VAT % from line items or by inference from amounts."""
     if item_vat_percents:
@@ -326,8 +351,8 @@ def _infer_vat_percent(
         return 0
     if base and base != 0:
         try:
-            return round(vat_amount / base * 100)
-        except ZeroDivisionError:
+            return int((vat_amount / base * HUNDRED).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        except (ZeroDivisionError, InvalidOperation):
             return 0
     return 0
 
@@ -388,14 +413,14 @@ def _fetch_all_invoices(client: Client, kind: GetInvoicesFilterkind, year: int) 
                 due_date = due_dates[0] if due_dates else None
                 paid_at: datetime.date | None = _val(attrs.paid_at)
 
-                base = _to_float(attrs.total_amount_without_taxes)
-                vat_amount = _to_float(attrs.vat_amount)
-                total = _to_float(attrs.total_amount)
-                retention_amount = _to_float(attrs.retention_amount) or 0.0
+                base = _to_decimal(attrs.total_amount_without_taxes)
+                vat_amount = _to_decimal(attrs.vat_amount)
+                total = _to_decimal(attrs.total_amount)
+                retention_amount = _to_decimal(attrs.retention_amount) or ZERO
 
                 item_vat_percents = [li.vat_percent for li in line_items if li.vat_percent]
                 vat_pct_value = _infer_vat_percent(item_vat_percents, vat_amount, base)
-                surcharge_total = sum(li.surcharge_amount for li in line_items)
+                surcharge_total = sum((li.surcharge_amount for li in line_items), start=ZERO)
                 concept = " | ".join(li.description for li in line_items if li.description)
 
                 # For issued invoices: the recipient is the client
